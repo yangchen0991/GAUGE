@@ -7,3 +7,5 @@ __pycache__/
 
 # 数据快照成品（refresh.py + template.html 可重新生成，含活库快照不入库）
 AI-Agent监控台.html
+brand/
+desktop/widget.json

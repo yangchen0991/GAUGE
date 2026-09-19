@@ -124,6 +124,10 @@ class _TrayState:
         self.pipe_lock = threading.Lock()   # Pipe.send 的跨线程互斥
         self.interval_secs = 300
         self.child_exiting = False
+        self.widget_pinned = False
+        self.start_monotonic = 0.0       # 运行状态统计用
+        self.refresh_count = 0
+        self.refresh_secs_total = 0.0
         # 桌面贴纸（配置真值在本进程；widget.json 是持久化镜像）
         self.widget_visible = True
         self.widget_passthrough = False
@@ -253,6 +257,8 @@ def refresh_once(reason):
         elapsed = time.monotonic() - t0
         if ok:
             log("刷新成功（%s，耗时 %.1fs）" % (reason, elapsed))
+            TRAY.refresh_count += 1
+            TRAY.refresh_secs_total += elapsed
             refresh_tooltip()
             if child_send("RELOAD"):
                 log("已通知窗口重载最新数据")
@@ -1142,6 +1148,14 @@ def child_msg_loop(pipe):
                 _persist_widget_cfg()          # 页面侧隐藏也要持久化，重启后保持隐藏
                 update_menu()
                 log("贴纸被页面侧隐藏，托盘菜单状态已同步")
+        elif isinstance(msg, list) and msg[:1] == ["WIDGET_PIN_RESULT"] and len(msg) >= 3:
+            want, ok = bool(msg[1]), bool(msg[2])
+            TRAY.widget_pinned = want if ok else False
+            _persist_widget_cfg()
+            update_menu()
+            if not ok:
+                notify_user("钉桌面", "当前系统不支持钉桌面模式，已保持置顶悬浮。")
+            log("钉桌面切换为 %s（结果 %s）" % ("开" if TRAY.widget_pinned else "关", ok))
 
 
 def run():
@@ -1155,6 +1169,7 @@ def run():
         return 0
     TRAY.srv = srv
     log("单实例锁绑定 127.0.0.1:%d" % SINGLE_PORT)
+    TRAY.start_monotonic = time.monotonic()
 
     # 成品 HTML 兜底：不存在时先跑一次 refresh.py 生成
     if not HTML_PATH.exists():

@@ -12,7 +12,7 @@ WIDGET_CFG_PATH: Path = Path(__file__).resolve().parent.parent / "widget.json"
 WIDGET_DEFAULT_POS = (1400, 140)
 
 DEFAULTS: Dict[str, Any] = {
-    "visible": True, "passthrough": False, "opacity": 0.75,
+    "visible": True, "passthrough": False, "pinned": False, "opacity": 0.75,
     "x": WIDGET_DEFAULT_POS[0], "y": WIDGET_DEFAULT_POS[1],
 }
 
@@ -25,6 +25,7 @@ def load_widget_cfg(path: Path = WIDGET_CFG_PATH) -> Dict[str, Any]:
         if isinstance(raw, dict):
             cfg["visible"] = bool(raw.get("visible", True))
             cfg["passthrough"] = bool(raw.get("passthrough", False))
+            cfg["pinned"] = bool(raw.get("pinned", False))
             o = raw.get("opacity", 0.75)
             cfg["opacity"] = min(1.0, max(0.3, float(o))) if isinstance(o, (int, float)) else 0.75
             x, y = raw.get("x"), raw.get("y")
@@ -43,6 +44,7 @@ def save_widget_cfg(cfg: Dict[str, Any], path: Path = WIDGET_CFG_PATH) -> bool:
         data = json.dumps({
             "visible": bool(cfg.get("visible", True)),
             "passthrough": bool(cfg.get("passthrough", False)),
+            "pinned": bool(cfg.get("pinned", False)),
             "opacity": float(cfg.get("opacity", 0.75)),
             "x": int(cfg.get("x", WIDGET_DEFAULT_POS[0])),
             "y": int(cfg.get("y", WIDGET_DEFAULT_POS[1])),

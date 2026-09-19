@@ -9,7 +9,8 @@ from monitor import config
 class TestLoadWidgetCfg:
     def test_missing_file_defaults(self, tmp_path: Path):
         cfg = config.load_widget_cfg(tmp_path / "no.json")
-        assert cfg == {"visible": True, "passthrough": False, "opacity": 0.75,
+        assert cfg == {"visible": True, "passthrough": False, "pinned": False,
+                       "opacity": 0.75,
                        "x": config.WIDGET_DEFAULT_POS[0], "y": config.WIDGET_DEFAULT_POS[1]}
 
     def test_normal_roundtrip(self, tmp_path: Path):
@@ -17,8 +18,8 @@ class TestLoadWidgetCfg:
         assert config.save_widget_cfg({"visible": False, "passthrough": True,
                                        "opacity": 0.6, "x": 100, "y": 200}, p)
         cfg = config.load_widget_cfg(p)
-        assert cfg == {"visible": False, "passthrough": True, "opacity": 0.6,
-                       "x": 100, "y": 200}
+        assert cfg == {"visible": False, "passthrough": True, "pinned": False,
+                       "opacity": 0.6, "x": 100, "y": 200}
 
     def test_corrupted_file_self_heal(self, tmp_path: Path):
         p = tmp_path / "bad.json"
