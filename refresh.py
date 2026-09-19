@@ -38,7 +38,9 @@ TEMPLATE_PATH = os.path.join(BASE_DIR, "template.html")
 OUTPUT_PATH = os.path.join(BASE_DIR, "AI-Agent监控台.html")
 # 测试钩子：AGENT_MONITOR_DB 环境变量可覆盖数据库路径（默认本机活库）
 DB_PATH = os.environ.get("AGENT_MONITOR_DB") or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
-DB_DISPLAY = "~/.zcode/cli/db/db.sqlite（只读导出）"
+# 测试钩子：AGENT_MONITOR_DB 环境变量可覆盖数据库路径（默认本机活库）
+DB_PATH = os.environ.get("AGENT_MONITOR_DB") or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+DB_DISPLAY = DB_PATH + "（只读导出）"
 PLACEHOLDER = "/*__DATA_PLACEHOLDER__*/null"
 
 # ---- 显示名映射（与 template.html 内回退映射保持一致；原始 id 始终保留在 DATA 中）----
@@ -355,11 +357,10 @@ def selfcheck(conn, scan_mu, tools_total, n_sess, n_sessions_sql):
 def build_payload(scan_mu, scan_tu, sess_rows):
     """把扫描结果组装为 template.html 消费端约定的 DATA 字典。
 
-    sessions 按创建时间升序（requests[].s 引用其下标，顺序稳定性是契约前提）；
-    requests 按开始时间升序（t 为 None 的行排尾部）；
+    前置条件：sess_rows 已由 main 按 (time_created, id) 排序（排序在扫描前完成，
+    保证 s_acc 累加器下标与本函数 enumerate 下标一致）；requests 按开始时间升序。
     st/fin 映射与错误类型仅随 status='error' 行携带。
     """
-    sess_rows.sort(key=lambda r: ((r[3] if r[3] is not None else 0), r[0] or ""))
     sess_idx = {r[0]: i for i, r in enumerate(sess_rows)}
 
     agent_order = sorted(scan_mu["agent_cnt"].keys(), key=lambda k: (-scan_mu["agent_cnt"][k], k))
@@ -468,6 +469,8 @@ def serialize_and_inject(tpl, payload, n_sess):
         die("序列化后的 JSON 无法回读解析：%s" % e)
     if len(back["sessions"]) != n_sess:
         die("回读验证失败：sessions 长度 %d ≠ SQL 会话数 %d" % (len(back["sessions"]), n_sess))
+    if len(back["requests"]) != len(payload["requests"]):
+        die("回读验证失败：requests 长度不一致")
     print("JSON 回读验证：OK（sessions=%d, requests=%d, tools=%d）"
           % (len(back["sessions"]), len(back["requests"]), len(back["tools"])))
 
@@ -513,12 +516,15 @@ def main():
     try:
         q = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
 
-        # 会话（按 time_created 升序 → 稳定下标）；行数与 SQL COUNT 双路径采集
+        # 会话：取出行后立即按 (time_created 升序, id) 排序——排序必须先于
+        # sess_idx 构建与行扫描聚合，保证扫描累加器下标与最终 DATA.sessions 下标一致
+        # （不变量：若在 build_payload 内才排序，DB 返回序≠排序序时统计会错位）
         sess_rows = q("SELECT id, title, directory, time_created, time_updated FROM session")
+        sess_rows.sort(key=lambda r: ((r[3] if r[3] is not None else 0), r[0] or ""))
         n_sess = len(sess_rows)
         n_sessions_sql = q("SELECT COUNT(*) FROM session")[0][0]
 
-        # ---- 3a/3b. 行扫描（路径 A）----
+        # ---- 3a/3b. 行扫描（路径 A；此时 sess_rows 已排序，下标与最终输出一致）----
         sess_idx = {r[0]: i for i, r in enumerate(sess_rows)}
         scan_mu = scan_model_usage(conn, sess_idx, n_sess)
         scan_tu = scan_tool_usage(conn, sess_idx, n_sess)

@@ -15,9 +15,11 @@ a = Analysis(
     pathex=[str(DESKTOP)],
     binaries=[],
     datas=[
-        # 冻结运行时需要的源码资源（refresh.py 线程内 importlib 加载；widget.html 为贴纸页面）
+        # 冻结运行时需要的源码资源（refresh.py 线程内 importlib 加载；
+        # widget.html 为贴纸页面；template.html 供 refresh.py 的 load_template 读取）
         (str(ROOT / "refresh.py"), "."),
         (str(DESKTOP / "widget.html"), "."),
+        (str(ROOT / "template.html"), "."),
     ],
     hiddenimports=[
         "monitor", "monitor.stats", "monitor.config", "monitor.pin_desktop",

@@ -51,6 +51,7 @@ import webbrowser
 from pathlib import Path
 
 from monitor.config import load_widget_cfg, save_widget_cfg
+from monitor.pin_desktop import pin_to_desktop, unpin_from_desktop
 from monitor.stats import today_stats, tooltip_text, widget_stats
 
 import pystray
@@ -155,6 +156,7 @@ def apply_widget_cfg(cfg):
     """把载入的贴纸配置字典应用到托盘状态（启动时与 widget.json 同步）。"""
     TRAY.widget_visible = bool(cfg.get("visible", True))
     TRAY.widget_passthrough = bool(cfg.get("passthrough", False))
+    TRAY.widget_pinned = bool(cfg.get("pinned", False))
     TRAY.widget_opacity = float(cfg.get("opacity", 0.75))
     TRAY.widget_pos = [int(cfg.get("x", WIDGET_DEFAULT_POS[0])),
                        int(cfg.get("y", WIDGET_DEFAULT_POS[1]))]
@@ -447,6 +449,39 @@ def toggle_passthrough(icon, item):
         notify_user("贴纸提示", "已开启鼠标穿透：贴纸不再响应点击，从托盘菜单「贴纸设置」关闭穿透后方可交互。")
 
 
+def toggle_pinned(icon, item):
+    """托盘「钉桌面模式」开关：请求子进程把贴纸 SetParent 到桌面 WorkerW 层。
+
+    结果由子进程异步回传（WIDGET_PIN_RESULT）驱动 checked/持久化；
+    与置顶互斥（钉住时 HWND_BOTTOM 清除 TOPMOST）。失败时子进程回传
+    ok=False，本侧回滚并气泡提示。
+    """
+    child_send(("WIDGET_PIN", not TRAY.widget_pinned))
+
+
+def tray_runtime_status(icon, item):
+    """托盘「运行状态」气泡：运行时长/两进程内存/刷新统计（psutil）。"""
+    import psutil
+    lines = []
+    if TRAY.start_monotonic:
+        up = time.monotonic() - TRAY.start_monotonic
+        lines.append("运行时长 %d 分 %02d 秒" % (up // 60, up % 60))
+    try:
+        me = psutil.Process(os.getpid()).memory_info()
+        lines.append("托盘进程 %.1f MB" % (me.rss / 1048576.0))
+        if TRAY.proc is not None and TRAY.proc.is_alive():
+            ch = psutil.Process(TRAY.proc.pid).memory_info()
+            lines.append("窗口进程 %.1f MB" % (ch.rss / 1048576.0))
+    except Exception:
+        lines.append("内存信息不可用")
+    if TRAY.refresh_count:
+        lines.append("刷新 %d 次 · 平均 %.2f 秒"
+                     % (TRAY.refresh_count, TRAY.refresh_secs_total / TRAY.refresh_count))
+    else:
+        lines.append("尚未刷新")
+    notify_user("运行状态", chr(10).join(lines))
+
+
 def set_widget_opacity(value):
     """设置贴纸透明度（托盘菜单三档单选）并持久化到 widget.json。"""
     TRAY.widget_opacity = value
@@ -474,6 +509,11 @@ def build_menu():
             "鼠标穿透",
             toggle_passthrough,
             checked=lambda item: TRAY.widget_passthrough,
+        ),
+        pystray.MenuItem(
+            "钉桌面模式（实验）",
+            toggle_pinned,
+            checked=lambda item: TRAY.widget_pinned,
         ),
         pystray.MenuItem(
             "透明度",
@@ -891,6 +931,15 @@ def _window_cmd_loop(state, pipe):
                 state.widget.hide()
             except Exception:
                 _log.exception("[win] 隐藏贴纸失败")
+        elif cmd == "WIDGET_PIN":
+            want = bool(payload)
+            hwnd = state.widget_native_hwnd or _win_hwnd(state.widget)
+            ok = False
+            if hwnd:
+                ok = pin_to_desktop(hwnd) if want else unpin_from_desktop(hwnd, keep_on_top=True)
+            log("[win] WIDGET_PIN=%s → %s" % (want, "成功" if ok else "失败"))
+            with _CHILD_PIPE_LOCK:
+                pipe.send(["WIDGET_PIN_RESULT", want, ok])
         elif cmd == "WIDGET_CFG":
             if isinstance(payload, dict):
                 state.cfg.update(payload)
@@ -1267,7 +1316,9 @@ def run():
     threading.Thread(
         target=lambda: (time.sleep(2), child_send(("WIDGET_DATA", widget_stats())),
                         child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
-                                                   "opacity": TRAY.widget_opacity}))),
+                                                   "pinned": TRAY.widget_pinned,
+                                                   "opacity": TRAY.widget_opacity})),
+                        child_send(("WIDGET_PIN", TRAY.widget_pinned))),
         daemon=True, name="widget-init",
     ).start()
 
