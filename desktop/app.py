@@ -39,13 +39,14 @@ import json
 import logging
 import multiprocessing
 import socket
-import sqlite3
 import subprocess
 import threading
 import time
 import webbrowser
-from datetime import datetime
 from pathlib import Path
+
+from monitor.config import load_widget_cfg, save_widget_cfg
+from monitor.stats import today_stats, tooltip_text, widget_stats
 
 import pystray
 import webview
@@ -59,26 +60,17 @@ REFRESH_PY = PARENT_DIR / "refresh.py"
 LOG_PATH = APP_DIR / "app.log"
 ICO_PATH = APP_DIR / "monitor.ico"
 SMOKE_PATH = APP_DIR / "smoke_result.json"
-WIDGET_CFG_PATH = APP_DIR / "widget.json"
-DB_PATH = Path.home() / ".zcode" / "cli" / "db" / "db.sqlite"
 
 WINDOW_TITLE = "AI Agent 监控台"
 WIDGET_TITLE = "监控台贴纸"
 SINGLE_PORT = 59321
 REFRESH_TIMEOUT = 600          # 秒，与 refresh.py 的超时口径一致
-TOOLTIP_MAX = 128              # Windows 托盘 tooltip 上限约 128 字符
 NOTIFY_MAX = 200               # 失败气泡最多展示 stderr 尾部 200 字
 CHILD_JOIN_TIMEOUT = 10        # 退出时等待窗口子进程的秒数
 WIDGET_SIZE = (340, 248)       # 贴纸逻辑尺寸（与 widget.html body 一致）
 WIDGET_DEFAULT_POS = (1400, 140)
 WIDGET_OPACITY_CHOICES = (("60%", 0.60), ("75%", 0.75), ("90%", 0.90))
 WIDGET_BACKDROP_MIN_BUILD = 22621   # DWMWA_SYSTEMBACKDROP_TYPE 的最低 Win11 build
-
-# 冻结价目（元/百万 token）：model_id -> (输入, 缓存读取, 输出)；未列出的模型按 0 计
-PRICES = {
-    "GLM-5.3-Flash": (0.8, 0.23, 2.8),
-    "GLM-5.3": (8.0, 2.0, 28.0),
-}
 
 # 自动刷新间隔选项（label, 秒）；0 = 关闭。默认 5 分钟。
 INTERVAL_CHOICES = (("5 分钟", 300), ("15 分钟", 900), ("30 分钟", 1800), ("关闭", 0))
@@ -140,47 +132,6 @@ class _TrayState:
         self.widget_used = False        # 用户是否启用过贴纸（首次默认开）
 
 
-def load_widget_cfg():
-    """读取 desktop/widget.json；缺失/损坏时返回默认值。"""
-    cfg = {
-        "visible": True, "passthrough": False, "opacity": 0.75,
-        "x": WIDGET_DEFAULT_POS[0], "y": WIDGET_DEFAULT_POS[1],
-    }
-    try:
-        raw = json.loads(WIDGET_CFG_PATH.read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            cfg["visible"] = bool(raw.get("visible", True))
-            cfg["passthrough"] = bool(raw.get("passthrough", False))
-            o = raw.get("opacity", 0.75)
-            cfg["opacity"] = min(1.0, max(0.3, float(o))) if isinstance(o, (int, float)) else 0.75
-            x, y = raw.get("x"), raw.get("y")
-            if isinstance(x, int) and isinstance(y, int):
-                cfg["x"], cfg["y"] = x, y
-    except FileNotFoundError:
-        pass
-    except Exception:
-        _log.exception("widget.json 读取失败，使用默认配置")
-    return cfg
-
-
-def save_widget_cfg():
-    """把贴纸配置写盘（主进程是唯一写者；tmp+os.replace 原子写防并发损坏）。"""
-    try:
-        data = json.dumps({
-            "visible": TRAY.widget_visible,
-            "passthrough": TRAY.widget_passthrough,
-            "opacity": TRAY.widget_opacity,
-            "x": TRAY.widget_pos[0],
-            "y": TRAY.widget_pos[1],
-        }, ensure_ascii=False, indent=2)
-        tmp = str(WIDGET_CFG_PATH) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(data)
-        os.replace(tmp, WIDGET_CFG_PATH)
-    except Exception:
-        _log.exception("widget.json 写入失败")
-
-
 def apply_widget_cfg(cfg):
     """把载入的贴纸配置字典应用到托盘状态（启动时与 widget.json 同步）。"""
     TRAY.widget_visible = bool(cfg.get("visible", True))
@@ -190,123 +141,19 @@ def apply_widget_cfg(cfg):
                        int(cfg.get("y", WIDGET_DEFAULT_POS[1]))]
 
 
+def _persist_widget_cfg() -> None:
+    """把当前托盘贴纸状态持久化到 widget.json（经由 monitor.config 原子写）。"""
+    if not save_widget_cfg({
+        "visible": TRAY.widget_visible,
+        "passthrough": TRAY.widget_passthrough,
+        "opacity": TRAY.widget_opacity,
+        "x": TRAY.widget_pos[0],
+        "y": TRAY.widget_pos[1],
+    }):
+        _log.exception("widget.json 写入失败")
+
+
 TRAY = _TrayState()
-
-
-# ---------- 今日统计（tooltip / 气泡用；只读数据库） ----------
-def today_stats():
-    """今日请求量、Token 与估算成本。
-
-    返回 {"requests": N, "cost": X, "in": A, "out": B, "cr": C}；查询失败返回 {"error": "..."}。
-    成本公式（与 Web 版一致，元/百万 token）：
-      cost = (input - cache_read) * 输入价 + cache_read * 缓存读取价 + output * 输出价
-    """
-    try:
-        midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        since_ms = int(midnight.timestamp() * 1000)   # 今日本地 00:00 的 epoch 毫秒
-        uri = DB_PATH.as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=5)
-        try:
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA query_only=1")
-            rows = conn.execute(
-                "SELECT model_id, COUNT(*), COALESCE(SUM(input_tokens),0), "
-                "COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read_input_tokens),0) "
-                "FROM model_usage WHERE started_at >= ? GROUP BY model_id",
-                (since_ms,),
-            ).fetchall()
-        finally:
-            conn.close()
-        n = 0
-        cost = 0.0
-        tin = tout = tcr = 0
-        for model_id, cnt, it, ot, cr in rows:
-            pin, pcr, pout = PRICES.get(model_id, (0.0, 0.0, 0.0))
-            n += cnt
-            tin += it
-            tout += ot
-            tcr += cr
-            cost += ((it - cr) * pin + cr * pcr + ot * pout) / 1000000.0
-        return {"requests": n, "cost": round(cost, 2), "in": tin, "out": tout, "cr": tcr}
-    except Exception as e:  # noqa: BLE001
-        _log.exception("今日统计查询失败")
-        return {"error": "%s: %s" % (type(e).__name__, e)}
-
-
-def widget_stats():
-    """贴纸数据包：今日 KPI + 近 7 天每日聚合 + 最近 24h 错误。
-
-    全部只读；失败返回 {"error": "..."}（贴纸侧显示占位）。
-    """
-    try:
-        t = today_stats()
-        if "error" in t:
-            return {"error": t["error"]}
-        uri = DB_PATH.as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=5)
-        try:
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA query_only=1")
-            week0 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            week0 = week0.fromtimestamp(week0.timestamp() - 6 * 86400)
-            since_ms = int(week0.timestamp() * 1000)
-            rows = conn.execute(
-                "SELECT date(started_at/1000,'unixepoch','localtime') AS d, model_id, "
-                "COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
-                "COALESCE(SUM(cache_read_input_tokens),0) "
-                "FROM model_usage WHERE started_at >= ? GROUP BY d, model_id",
-                (since_ms,),
-            ).fetchall()
-            err = conn.execute(
-                "SELECT error_type, started_at FROM model_usage "
-                "WHERE status='error' AND error_type IS NOT NULL AND TRIM(error_type)<>'' "
-                "AND started_at >= ? "
-                "ORDER BY started_at DESC LIMIT 1",
-                (int((time.time() - 86400) * 1000),),
-            ).fetchone()
-        finally:
-            conn.close()
-        agg = {}
-        for d, model_id, cnt, it, ot, cr in rows:
-            pin, pcr, pout = PRICES.get(model_id, (0.0, 0.0, 0.0))
-            e = agg.setdefault(d, {"req": 0, "cost": 0.0})
-            e["req"] += cnt
-            e["cost"] += ((it - cr) * pin + cr * pcr + ot * pout) / 1000000.0
-        week = []
-        for i in range(7):
-            day = week0.fromtimestamp(week0.timestamp() + i * 86400)
-            key = day.strftime("%Y-%m-%d")
-            e = agg.get(key, {"req": 0, "cost": 0.0})
-            week.append({
-                "d": day.strftime("%m-%d"),
-                "full": key,
-                "req": e["req"],
-                "cost": round(e["cost"], 2),
-            })
-        last_error = None
-        if err and err[0]:
-            et, ets = err
-            last_error = {
-                "type": str(et),
-                "at": datetime.fromtimestamp((ets or 0) / 1000).strftime("%H:%M"),
-            }
-        return {
-            "today": t,
-            "week": week,
-            "last_error": last_error,
-            "generated_at": datetime.now().strftime("%H:%M:%S"),
-        }
-    except Exception as e:  # noqa: BLE001
-        _log.exception("贴纸统计查询失败")
-        return {"error": "%s: %s" % (type(e).__name__, e)}
-
-
-def tooltip_text():
-    """生成托盘悬停提示：今日请求与估算成本；查询失败显示占位文案。"""
-    st = today_stats()
-    if "error" in st:
-        return "AI Agent 监控台\n数据读取失败"
-    return ("AI Agent 监控台\n今日请求 %d · 估算 ¥%.2f" % (st["requests"], st["cost"]))[:TOOLTIP_MAX]
 
 
 # ---------- 托盘图标（PIL 运行时生成） ----------
@@ -525,7 +372,7 @@ def toggle_widget(icon, item):
     """托盘「桌面贴纸」开关：显隐贴纸窗口并持久化配置。"""
     TRAY.widget_visible = not TRAY.widget_visible
     child_send(("WIDGET_SHOW" if TRAY.widget_visible else "WIDGET_HIDE", None))
-    save_widget_cfg()
+    _persist_widget_cfg()
     update_menu()
     log("桌面贴纸切换为 %s" % ("显示" if TRAY.widget_visible else "隐藏"))
 
@@ -535,12 +382,11 @@ def toggle_passthrough(icon, item):
     TRAY.widget_passthrough = not TRAY.widget_passthrough
     child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
                                "opacity": TRAY.widget_opacity}))
-    save_widget_cfg()
+    _persist_widget_cfg()
     update_menu()
     log("贴纸鼠标穿透切换为 %s" % ("开" if TRAY.widget_passthrough else "关"))
     if TRAY.widget_passthrough:
-        notify_user("贴纸提示", "已开启鼠标穿透：贴纸不再响应点击，"
-                                "从托盘菜单「贴纸设置」关闭穿透后方可交互。")
+        notify_user("贴纸提示", "已开启鼠标穿透：贴纸不再响应点击，从托盘菜单「贴纸设置」关闭穿透后方可交互。")
 
 
 def set_widget_opacity(value):
@@ -548,7 +394,7 @@ def set_widget_opacity(value):
     TRAY.widget_opacity = value
     child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
                                "opacity": TRAY.widget_opacity}))
-    save_widget_cfg()
+    _persist_widget_cfg()
     update_menu()
     log("贴纸透明度切换为 %d%%" % round(value * 100))
 
@@ -1082,7 +928,7 @@ def window_process_main(pipe, widget_cfg=None):
 
 def child_watch_loop(proc):
     """监控窗口子进程：意外死亡时提示并停托盘，让整个应用干净退出。"""
-    code = proc.join()
+    proc.join()
     if TRAY.child_exiting or TRAY.stop_event.is_set():
         return
     log("窗口子进程意外退出（exitcode=%r）" % (proc.exitcode,))
@@ -1286,14 +1132,14 @@ def child_msg_loop(pipe):
         if isinstance(msg, list) and msg[:1] == ["WIDGET_POS"] and len(msg) >= 3:
             try:
                 TRAY.widget_pos = [int(msg[1]), int(msg[2])]
-                save_widget_cfg()
+                _persist_widget_cfg()
                 log("贴纸位置已保存：%d,%d" % (msg[1], msg[2]))
             except Exception:
                 _log.exception("贴纸位置保存失败")
         elif msg == "WIDGET_STATE:hidden":
             if TRAY.widget_visible:
                 TRAY.widget_visible = False
-                save_widget_cfg()          # 页面侧隐藏也要持久化，重启后保持隐藏
+                _persist_widget_cfg()          # 页面侧隐藏也要持久化，重启后保持隐藏
                 update_menu()
                 log("贴纸被页面侧隐藏，托盘菜单状态已同步")
 
