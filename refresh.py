@@ -289,7 +289,8 @@ def scan_tool_usage(conn, sess_idx, n_sess):
     for (sid, name, status, d, ro, de, ca) in tu_rows:
         total += 1
         nm = clean(name) or "(未知)"
-        e = tool_acc.setdefault(nm, {"calls": 0, "errs": 0, "dsum": 0, "ro": 0, "destr": 0, "canc": 0})
+        e = tool_acc.setdefault(nm, {"calls": 0, "errs": 0, "dsum": 0,
+                             "ro": 0, "destr": 0, "canc": 0})
         e["calls"] += 1
         if status == "error":
             e["errs"] += 1
