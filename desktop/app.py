@@ -311,8 +311,15 @@ def tooltip_text():
 
 # ---------- 托盘图标（PIL 运行时生成） ----------
 def build_icon_image():
-    """深蓝圆角方块 + 亮蓝三柱；同步保存 monitor.ico 供快捷方式使用。异常时纯色兜底。"""
+    """深蓝圆角方块 + 亮蓝三柱；同步保存 monitor.ico 供快捷方式使用。异常时纯色兜底。
+
+    性能注记：PIL._typing 会连带 import numpy，而 numpy 2.x 的 OpenBLAS 线程池
+    在多核机器（本机 24 逻辑核）按核预留提交内存，实测约 +740MB Private。
+    本应用不用 numpy/BLAS 数值计算，固定单线程即可消除该预留（实测 773→约 20MB）。
+    必须在首次 import PIL（进而 import numpy）之前设置。"""
     try:
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
         from PIL import Image, ImageDraw
         img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
