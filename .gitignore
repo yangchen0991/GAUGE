@@ -1,0 +1,9 @@
+# 运行时生成物（可由源码重新生成）
+app.log
+smoke_result.json
+monitor.ico
+__pycache__/
+*.pyc
+
+# 数据快照成品（refresh.py + template.html 可重新生成，含活库快照不入库）
+AI-Agent监控台.html
