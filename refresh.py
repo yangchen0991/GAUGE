@@ -70,6 +70,7 @@ PRICING_USD = {
 
 
 def die(msg):
+    """打印中文错误信息并以非零退出码终止脚本（不产出任何成品文件）。"""
     print("[刷新失败] " + msg, file=sys.stderr)
     sys.exit(1)
 
@@ -106,6 +107,11 @@ def st_of(status, cancelled_by_user):
 
 
 def fin_of(f):
+    """finish_reason 归一化：stop→0（自然结束）、tool-calls→1（调用工具）、其他/NULL→2。
+
+    该映射写入 DATA.requests[].fin（JSON 契约的一部分），供页面按需消费；
+    template.html「数据说明」页的字段约定表记录了同一套 0/1/2 值。
+    """
     if f == "stop":
         return 0
     if f == "tool-calls":
@@ -114,6 +120,13 @@ def fin_of(f):
 
 
 def open_db():
+    """以只读方式打开 ZCode 会话库并返回连接。
+
+    双重只读保险：URI `mode=ro`（打开层面禁止写）+ `PRAGMA query_only=1`
+    （会话层面禁止任何写语句）。开启 busy_timeout 应对宿主应用并发写入；
+    `BEGIN DEFERRED` 建立 WAL 读快照，保证"行扫描"与"聚合 SQL"两条自检
+    路径看到同一份数据。失败时 die（中文报错，保留旧成品文件）。
+    """
     if not os.path.exists(DB_PATH):
         die("未找到数据库文件：%s。请确认 ZCode 已在本机安装并运行过。" % DB_PATH)
     try:
@@ -157,6 +170,11 @@ def node_syntax_check(html_text):
 
 
 def main():
+    """数据抽取主流程：模板校验 → 只读建快照 → 行扫描 → 双路径自检 →
+    组装 DATA → JSON 回读验证 → 注入模板 → JS 语法/外链检查 → 原子写入成品。
+
+    任何一步失败都会 die（中文报错、退出码非 0），旧成品文件保持不变。
+    """
     print("=== AI Agent 监控台 数据刷新 ===")
     print("数据库（只读）：" + DB_PATH)
 

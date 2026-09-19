@@ -94,6 +94,7 @@ _log = logging.getLogger("agent_monitor")
 
 
 def log(msg):
+    """写一条 INFO 日志（带进程前缀，双进程写同一 app.log）。"""
     _log.info(msg)
 
 
@@ -163,20 +164,25 @@ def load_widget_cfg():
 
 
 def save_widget_cfg():
-    """把贴纸配置写盘（主进程是唯一写者）。"""
+    """把贴纸配置写盘（主进程是唯一写者；tmp+os.replace 原子写防并发损坏）。"""
     try:
-        WIDGET_CFG_PATH.write_text(json.dumps({
+        data = json.dumps({
             "visible": TRAY.widget_visible,
             "passthrough": TRAY.widget_passthrough,
             "opacity": TRAY.widget_opacity,
             "x": TRAY.widget_pos[0],
             "y": TRAY.widget_pos[1],
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        }, ensure_ascii=False, indent=2)
+        tmp = str(WIDGET_CFG_PATH) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, WIDGET_CFG_PATH)
     except Exception:
         _log.exception("widget.json 写入失败")
 
 
 def apply_widget_cfg(cfg):
+    """把载入的贴纸配置字典应用到托盘状态（启动时与 widget.json 同步）。"""
     TRAY.widget_visible = bool(cfg.get("visible", True))
     TRAY.widget_passthrough = bool(cfg.get("passthrough", False))
     TRAY.widget_opacity = float(cfg.get("opacity", 0.75))
@@ -253,7 +259,8 @@ def widget_stats():
             ).fetchall()
             err = conn.execute(
                 "SELECT error_type, started_at FROM model_usage "
-                "WHERE status='error' AND started_at >= ? "
+                "WHERE status='error' AND error_type IS NOT NULL AND TRIM(error_type)<>'' "
+                "AND started_at >= ? "
                 "ORDER BY started_at DESC LIMIT 1",
                 (int((time.time() - 86400) * 1000),),
             ).fetchone()
@@ -295,6 +302,7 @@ def widget_stats():
 
 
 def tooltip_text():
+    """生成托盘悬停提示：今日请求与估算成本；查询失败显示占位文案。"""
     st = today_stats()
     if "error" in st:
         return "AI Agent 监控台\n数据读取失败"
@@ -369,6 +377,7 @@ def child_send(cmd):
 
 
 def refresh_tooltip():
+    """数据刷新成功后刷新托盘悬停提示。"""
     icon = TRAY.icon
     if icon is None:
         return
@@ -403,6 +412,7 @@ def refresh_once(reason):
 
 
 def auto_refresh_loop():
+    """自动刷新后台线程：按当前间隔循环触发刷新；间隔切换或退出经 Event 立即唤醒。"""
     log("自动刷新线程运行中（当前间隔 %d 秒）" % TRAY.interval_secs)
     while not TRAY.stop_event.is_set():
         iv = TRAY.interval_secs
@@ -424,6 +434,7 @@ def auto_refresh_loop():
 
 # ---------- 托盘 ----------
 def notify_user(title, message):
+    """托盘气泡通知（平台不支持或托盘不可用时静默降级为日志）。"""
     icon = TRAY.icon
     if icon is None:
         log("托盘不可用，气泡未发送：%s | %s" % (title, message))
@@ -438,6 +449,7 @@ def notify_user(title, message):
 
 
 def set_interval(secs):
+    """切换自动刷新间隔并立即生效（唤醒计时线程按新间隔重排）。"""
     TRAY.interval_secs = secs
     TRAY.refresh_wake.set()      # 立即生效：唤醒计时循环
     log("自动刷新间隔切换为 %d 秒" % secs)
@@ -445,6 +457,7 @@ def set_interval(secs):
 
 
 def update_menu():
+    """让 pystray 重建菜单（radio/checked 状态由动态回调结果决定）。"""
     icon = TRAY.icon
     if icon is None:
         return
@@ -455,6 +468,7 @@ def update_menu():
 
 
 def tray_notify(icon, item):
+    """托盘菜单「今日用量气泡」：读取今日统计并以气泡展示。"""
     st = today_stats()
     if "error" in st:
         notify_user("今日用量", "数据读取失败：%s" % st["error"])
@@ -463,6 +477,7 @@ def tray_notify(icon, item):
 
 
 def tray_open_dir(icon, item):
+    """托盘菜单「打开数据目录」：在资源管理器中打开 agent-monitor 目录。"""
     try:
         os.startfile(str(PARENT_DIR))
     except Exception:
@@ -500,6 +515,7 @@ def _interval_item(label, secs):
 
 
 def toggle_widget(icon, item):
+    """托盘「桌面贴纸」开关：显隐贴纸窗口并持久化配置。"""
     TRAY.widget_visible = not TRAY.widget_visible
     child_send(("WIDGET_SHOW" if TRAY.widget_visible else "WIDGET_HIDE", None))
     save_widget_cfg()
@@ -508,6 +524,7 @@ def toggle_widget(icon, item):
 
 
 def toggle_passthrough(icon, item):
+    """托盘「鼠标穿透」开关：切换整窗点击穿透并持久化配置（开启时气泡提示）。"""
     TRAY.widget_passthrough = not TRAY.widget_passthrough
     child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
                                "opacity": TRAY.widget_opacity}))
@@ -520,6 +537,7 @@ def toggle_passthrough(icon, item):
 
 
 def set_widget_opacity(value):
+    """设置贴纸透明度（托盘菜单三档单选）并持久化到 widget.json。"""
     TRAY.widget_opacity = value
     child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
                                "opacity": TRAY.widget_opacity}))
@@ -529,6 +547,7 @@ def set_widget_opacity(value):
 
 
 def _opacity_item(label, value):
+    """透明度单选项工厂（radio 组，checked 比较当前透明度档位）。"""
     return pystray.MenuItem(
         label,
         lambda icon, item: set_widget_opacity(value),
@@ -538,6 +557,7 @@ def _opacity_item(label, value):
 
 
 def build_menu():
+    """构建托盘菜单树（checked 回调均为单参 item，action 为双参 icon,item）。"""
     widget_submenu = pystray.Menu(
         pystray.MenuItem(
             "鼠标穿透",
@@ -615,9 +635,11 @@ def patch_shell_notify():
 
 
 def start_tray():
+    """构建托盘图标并预检菜单构建；成功返回 Icon 实例，失败返回 None（已弹窗/留日志）。"""
     icon_img = build_icon_image()
     if icon_img is None:
         log("托盘图标不可用，跳过托盘（窗口功能不受影响）")
+        error_dialog("托盘图标生成失败（PIL 不可用），无法启动。\n详情见 desktop\\app.log")
         return None
     TRAY.icon = pystray.Icon(
         "agent-monitor", icon=icon_img, title=tooltip_text(), menu=build_menu()
@@ -636,6 +658,8 @@ def start_tray():
 
 # ---------- 窗口子进程 ----------
 class _WindowState:
+    """窗口子进程状态：主面板与贴纸两个窗口对象、就绪事件、退出标志与贴纸配置缓存。"""
+
     def __init__(self):
         self.window = None            # 主面板窗口
         self.widget = None            # 桌面贴纸窗口
@@ -650,6 +674,7 @@ class _WindowState:
 
 
 def on_loaded(state):
+    """主面板 loaded 事件：标记窗口就绪并留日志。"""
     state.window_ready.set()
     log("页面加载完成：%s" % HTML_PATH.name)
 
@@ -749,6 +774,7 @@ class WidgetApi:
         self._state = state
 
     def open_main(self):
+        """展开主面板窗口（贴纸「展开」按钮）。"""
         try:
             if self._state.window is not None:
                 self._state.window.show()
@@ -758,6 +784,7 @@ class WidgetApi:
             return False
 
     def hide_widget(self):
+        """隐藏贴纸（页面侧触发，同步托盘菜单勾选状态）。"""
         try:
             if self._state.widget is not None:
                 self._state.widget.hide()
@@ -845,6 +872,7 @@ def _widget_backdrop_retry(state, attempts=6):
 
 
 def on_widget_loaded(state):
+    """贴纸 loaded 事件：应用毛玻璃/穿透/透明度；native 未就绪时转入延迟重试。"""
     state.widget_ready.set()
     log("[win] 贴纸页面加载完成")
     hwnd = _win_hwnd(state.widget)
@@ -878,6 +906,7 @@ def on_widget_loaded(state):
 
 
 def on_widget_shown(state):
+    """贴纸 shown 事件：重打 DWM backdrop（窗口重新显示后可能被系统重置）。"""
     # pywebview 会在主题变化时重设 backdrop，show 时重打一次
     hwnd = state.widget_native_hwnd or _win_hwnd(state.widget)
     if hwnd:
@@ -1095,6 +1124,7 @@ def bind_single_instance():
 
 
 def notify_existing_instance():
+    """单实例协议：通知已运行实例唤出窗口。返回是否发送成功。"""
     try:
         with socket.create_connection(("127.0.0.1", SINGLE_PORT), timeout=2) as c:
             c.sendall(b"SHOW")
@@ -1148,6 +1178,7 @@ def webview2_dialog(missing):
 
 
 def error_dialog(msg):
+    """错误弹窗（tkinter，仅托盘主进程调用；不阻断非交互场景）。"""
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -1255,11 +1286,14 @@ def child_msg_loop(pipe):
         elif msg == "WIDGET_STATE:hidden":
             if TRAY.widget_visible:
                 TRAY.widget_visible = False
+                save_widget_cfg()          # 页面侧隐藏也要持久化，重启后保持隐藏
                 update_menu()
                 log("贴纸被页面侧隐藏，托盘菜单状态已同步")
 
 
 def run():
+    """托盘主进程主流程：单实例锁 → 成品 HTML 兜底 → WebView2 预检 → 托盘初始化 →
+        窗口子进程 → 初始数据推送 → 消息循环 → 退出清理。返回进程退出码。"""
     # 单实例锁
     srv = bind_single_instance()
     if srv is None:
@@ -1289,7 +1323,8 @@ def run():
     patch_shell_notify()
     icon = start_tray()
     if icon is None:
-        error_dialog("托盘图标初始化失败（PIL 不可用），无法启动。\n详情见 desktop\\app.log")
+        # start_tray 的各失败分支已弹出准确原因（图标生成失败/菜单构建失败），此处只收口
+        log("托盘初始化失败，应用退出")
         return 1
 
     # 窗口子进程（携带贴纸配置；主进程是 widget.json 唯一写者）
@@ -1348,6 +1383,7 @@ def run():
 
 
 def main():
+    """进程入口：解析 --smoke、初始化日志、分发主流程、写出冒烟结果并返回退出码。"""
     smoke = "--smoke" in sys.argv[1:]
     setup_logging("tray" if not smoke else None)
     log("=== %s 桌面版启动（smoke=%s, python=%s, exe=%s）==="

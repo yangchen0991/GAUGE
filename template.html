@@ -567,6 +567,7 @@ var LS_KEY='agentmon_prices_v1';
 var SVC=null,sessReqIdx=null;
 
 function modelOf(r){return DATA.models[r.m];}
+// 单请求成本（元）：非缓存输入×输入价 + 缓存读取×缓存价 + 输出×输出价（与 refresh.py/托盘口径一致）
 function costOf(r){
   var p=PRICES[DATA.models[r.m]]||{input:0,output:0,cache_read:0};
   var i=r.i||0,cr=r.cr||0;
@@ -581,6 +582,7 @@ function rangeStart(){
   return d.getTime();
 }
 
+// 按全局时间范围过滤请求并聚合出各页面共用的视图数据（日序列/Agent/Provider/模型/项目/小时分布）
 function buildView(){
   var start=rangeStart();
   var reqs=[];
@@ -658,6 +660,7 @@ function buildView(){
         proj:proj,tot:tot,hour:hour,errTypes:errTypes,ttAll:ttAll,durAll:durAll,sessInRange:sessInRange};
 }
 
+// 重算每个会话的累计成本（单价变更后调用；只累加该会话自己的请求）
 function refreshSVCost(){
   for(var i=0;i<SVC.length;i++)SVC[i].cost=0;
   for(var k=0;k<DATA.requests.length;k++){
@@ -667,6 +670,7 @@ function refreshSVCost(){
 }
 
 /* ============ 总览 ============ */
+// 总览页：KPI 卡片 + Agent 卡片行 + Provider 占比条 + 项目 Top5
 function renderOverview(){
   var V=VIEW,T=V.tot;
   var box=$('ov-kpis');box.textContent='';
@@ -742,6 +746,7 @@ function renderOverview(){
 }
 
 /* ============ 趋势 ============ */
+// 趋势页：每日按 Agent 堆叠柱（随指标切换）+ 日成功率 + TTFT 分位 + 24 小时分布
 function renderTrend(){
   var V=VIEW,N=V.days.length;
   var labels=V.days.map(function(t){return fmtDay(t,N>120);});
@@ -793,6 +798,7 @@ function buildSVC(){
     v.mainM=best;
   });
 }
+// 会话明细的筛选与排序（搜索/Agent/模型/Provider/项目/日期/状态；独立于全局范围）
 function collectSessRows(){
   var f=state.sf,rows=SVC;
   if(f.q){
@@ -817,6 +823,7 @@ function collectSessRows(){
     return (b.s.t1||b.s.t0||0)-(a.s.t1||a.s.t0||0);
   });
 }
+// 行展开内容：该会话按模型的请求/Token/成本明细小表
 function sessionModelDetailTable(idx){
   var wrap=elIn(document.createElement('div'),'div','');
   var list=sessReqIdx[idx]||[];
@@ -849,6 +856,7 @@ function sessionModelDetailTable(idx){
   });
   return wrap;
 }
+// 会话明细页：按筛选/排序渲染当前页 50 行，支持行展开查看按模型明细
 function renderSessions(){
   var rows=collectSessRows();
   var pages=Math.max(1,Math.ceil(rows.length/PAGE));
@@ -900,6 +908,7 @@ function renderSessions(){
 }
 
 /* ============ 成本分布 ============ */
+// 成本页：模型环形图 + 成本构成表 + Agent/Provider/项目条形 + 每日堆叠 + 口径说明
 function renderCostCharts(){
   var V=VIEW;
   var parts=[];
@@ -980,6 +989,7 @@ function renderCostCharts(){
   kv('缓存写入','cache_creation_input_tokens 本库恒为 0，缓存写入价按 0 计');
 }
 
+// 单价编辑器：修改即时重算全页并写 localStorage（只更新数据不重建自身，避免输入失焦）
 function renderEditor(){
   var box=$('ct-editor');box.textContent='';
   var tb=elIn(box,'table','');
@@ -1040,6 +1050,7 @@ function resetPrices(){
 }
 
 /* ============ 工具与质量 ============ */
+// 工具与质量页：错误/取消/重试 KPI + 错误类型条形 + 请求时长直方图 + 工具调用 Top 表
 function renderQuality(){
   var V=VIEW,T=V.tot;
   var box=$('ql-cards');box.textContent='';
@@ -1091,6 +1102,7 @@ function renderQuality(){
 }
 
 /* ============ 数据说明 ============ */
+// 数据说明页：来源/口径/价目表/字段映射表的静态渲染
 function renderAbout(){
   var meta=DATA.meta;
   $('ab-db').textContent=meta.db_path;
@@ -1164,6 +1176,7 @@ function renderAll(){
   renderAbout();
 }
 
+// 事件绑定与首次渲染入口（Tab 切换/范围选择/明细筛选/分页/单价恢复默认）
 function init(){
   tipEl=$('tt');
   if(!DATA){
