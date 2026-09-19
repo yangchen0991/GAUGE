@@ -12,7 +12,7 @@
 """
 import ctypes
 from ctypes import wintypes
-from typing import Optional, Tuple
+from typing import Optional
 
 user32 = ctypes.windll.user32
 
