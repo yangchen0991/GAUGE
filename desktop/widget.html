@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" href="data:,">
+<title>监控台贴纸</title>
+<style>
+/* 桌面贴纸 — 深色毛玻璃（窗口层 DWM Acrylic 由 app.py 设置，此处背景保持透明） */
+:root{
+  --tx:#e6ecf7;--tx2:#93a1bd;--tx3:#6d7a99;--acc:#4f8cff;--ok:#22c55e;--err:#ef4444;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:transparent;overflow:hidden;
+  font:13px/1.45 "Segoe UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  color:var(--tx);width:340px;height:248px;user-select:none}
+#widget{
+  width:340px;height:248px;border-radius:14px;
+  /* 毛玻璃有效时透出 DWM Acrylic 模糊；失效时此底色保证可读性 */
+  background:rgba(13,18,32,.78);
+  border:1px solid rgba(79,140,255,.28);
+  box-shadow:0 8px 28px rgba(0,0,0,.45);
+  display:flex;flex-direction:column;overflow:hidden;
+}
+header{
+  display:flex;align-items:center;gap:8px;padding:9px 12px 7px;cursor:default;
+  background:rgba(79,140,255,.10);border-bottom:1px solid rgba(79,140,255,.16);
+}
+header .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);flex:none}
+header .t{font-size:12px;font-weight:600;letter-spacing:.4px}
+header .sp{flex:1}
+header button{
+  background:rgba(79,140,255,.14);border:1px solid rgba(79,140,255,.30);color:var(--tx2);
+  border-radius:5px;font-size:11px;padding:2px 8px;cursor:pointer;
+}
+header button:hover{color:var(--tx);background:rgba(79,140,255,.28)}
+main{flex:1;padding:10px 14px 6px;display:flex;flex-direction:column;min-height:0}
+.kpis{display:flex;align-items:baseline;gap:14px}
+.kpi .v{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.kpi .v.cost{color:#7fb0ff}
+.kpi .k{font-size:11px;color:var(--tx3);margin-top:-2px}
+.tokens{margin:7px 0 4px;font-size:11px;color:var(--tx2);line-height:1.7}
+.tokens b{color:var(--tx);font-weight:600;font-variant-numeric:tabular-nums}
+#week{width:100%;height:74px;display:block}
+#week .bar{cursor:pointer}
+#errbar{
+  display:none;margin-top:6px;padding:4px 9px;border-radius:6px;font-size:11px;
+  background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.35);color:#f0a5a5;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+footer{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:4px 12px 7px;font-size:10px;color:var(--tx3);
+  border-top:1px solid rgba(79,140,255,.12);
+}
+</style>
+</head>
+<body>
+<div id="widget">
+  <header onmousedown="if(event.target.tagName!=='BUTTON'&&window.pywebview&&window.pywebview.api)window.pywebview.api.start_drag()">
+    <span class="dot" id="dot"></span>
+    <span class="t">AI Agent 监控台</span>
+    <span class="sp"></span>
+    <button id="btn-open" title="打开完整面板">展开</button>
+    <button id="btn-hide" title="隐藏贴纸（托盘菜单可再打开）">隐藏</button>
+  </header>
+  <main>
+    <div class="kpis">
+      <div class="kpi"><div class="v cost" id="k-cost">—</div><div class="k">今日估算成本</div></div>
+      <div class="kpi"><div class="v" id="k-req">—</div><div class="k">今日请求</div></div>
+    </div>
+    <div class="tokens" id="tokens">数据加载中…</div>
+    <svg id="week" viewBox="0 0 312 74" preserveAspectRatio="none"></svg>
+    <div id="errbar"></div>
+  </main>
+  <footer>
+    <span id="ft-time">—</span>
+    <span>目录价估算 · 非账单</span>
+  </footer>
+</div>
+<script>
+'use strict';
+function elIn(p,tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;p.appendChild(e);return e;}
+function fmtInt(n){return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g,',');}
+function fmtTok(n){var a=Math.abs(n);if(a>=1e8)return (n/1e8).toFixed(2)+'亿';if(a>=1e4)return (n/1e4).toFixed(1)+'万';return fmtInt(n);}
+function fmtCost(n){var a=Math.abs(n);return '¥'+(a>0&&a<1?n.toFixed(4):(a>=100?n.toFixed(1):n.toFixed(2)));}
+
+/* 7 天迷你柱状图：柱=估算成本，柱顶悬停显示请求/成本；SVG 手绘，风格与主面板一致 */
+function renderWeek(days){
+  var svg=document.getElementById('week');
+  while(svg.firstChild)svg.removeChild(svg.firstChild);
+  var N=days.length;if(!N)return;
+  var W=312,H=74,L=2,R=2,T=10,B=16,iw=W-L-R,ih=H-T-B;
+  var max=0,i;
+  for(i=0;i<N;i++)if(days[i].cost>max)max=days[i].cost;
+  if(max<=0)max=1;
+  var bw=Math.max(2,iw/N*0.6);
+  for(i=0;i<N;i++){
+    (function(d){
+      var cx=L+iw*(i+0.5)/N;
+      var hh=d.cost>0?d.cost/max*ih:0;
+      var r=elIn(svg,'rect','bar');
+      r.setAttribute('x',(cx-bw/2).toFixed(1));r.setAttribute('y',(T+ih-hh).toFixed(1));
+      r.setAttribute('width',bw.toFixed(1));r.setAttribute('height',Math.max(hh,1).toFixed(1));
+      r.setAttribute('rx','2');r.setAttribute('fill',d.cost>0?'#4f8cff':'#24304a');
+      r.setAttribute('opacity','0.92');
+      var t=elIn(svg,'text');
+      t.setAttribute('x',cx.toFixed(1));t.setAttribute('y',H-4);
+      t.setAttribute('text-anchor','middle');t.setAttribute('fill','#6d7a99');
+      t.setAttribute('font-size','9');
+      t.textContent=d.d;
+      var hit=elIn(svg,'rect');
+      hit.setAttribute('x',(L+iw*i/N).toFixed(1));hit.setAttribute('y',T);
+      hit.setAttribute('width',(iw/N).toFixed(1));hit.setAttribute('height',ih);
+      hit.setAttribute('fill','transparent');
+      hit.setAttribute('title',d.full+'：'+fmtInt(d.req)+' 次 · '+fmtCost(d.cost));
+    })(days[i]);
+  }
+}
+
+/* 主进程通过 evaluate_js 调用：注入最新统计数据 */
+function renderWidget(data){
+  try{
+    if(!data||data.error)return;
+    var t=data.today||{};
+    document.getElementById('k-cost').textContent=fmtCost(t.cost||0);
+    document.getElementById('k-req').textContent=fmtInt(t.requests||0);
+    document.getElementById('tokens').innerHTML='';
+    var tk=document.getElementById('tokens');
+    /* 数据均为本机 fmt 函数输出（纯数字/汉字），无注入面 */
+    tk.innerHTML='输入 <b>'+fmtTok(t['in']||0)+'</b>（其中缓存 <b>'+fmtTok(t.cr||0)+'</b>） · 输出 <b>'+fmtTok(t.out||0)+'</b>';
+    renderWeek(data.week||[]);
+    var eb=document.getElementById('errbar');
+    if(data.last_error){
+      eb.style.display='block';
+      eb.textContent='最近错误：'+data.last_error.type+'（'+data.last_error.at+'）';
+    }else{eb.style.display='none';}
+    document.getElementById('ft-time').textContent='更新于 '+(data.generated_at||'—');
+    document.getElementById('dot').style.background='#22c55e';
+  }catch(e){
+    document.getElementById('dot').style.background='#ef4444';
+  }
+}
+
+/* 数据未注入前先渲染空骨架，避免白板 */
+renderWidget({today:{},week:[],generated_at:'等待数据…'});
+
+/* 按钮交互：pywebview js_api 由窗口子进程注入 */
+document.getElementById('btn-open').addEventListener('click',function(){
+  if(window.pywebview&&window.pywebview.api)window.pywebview.api.open_main();
+});
+document.getElementById('btn-hide').addEventListener('click',function(){
+  if(window.pywebview&&window.pywebview.api)window.pywebview.api.hide_widget();
+});
+</script>
+</body>
+</html>
