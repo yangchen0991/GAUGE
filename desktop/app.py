@@ -35,6 +35,11 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
+# ---- PyInstaller 冻结环境：multiprocessing spawn 子进程引导必须最早接管 ----
+if getattr(sys, "frozen", False):
+    import multiprocessing
+    multiprocessing.freeze_support()
+
 import json
 import logging
 import multiprocessing
@@ -52,11 +57,21 @@ import pystray
 import webview
 
 # ---------- 路径与常量 ----------
-APP_DIR = Path(__file__).resolve().parent          # ...\agent-monitor\desktop
-PARENT_DIR = APP_DIR.parent                        # ...\agent-monitor
-HTML_PATH = PARENT_DIR / "AI-Agent监控台.html"
-WIDGET_HTML_PATH = APP_DIR / "widget.html"
-REFRESH_PY = PARENT_DIR / "refresh.py"
+# 冻结（exe）与源码两种形态：
+#   源码：APP_DIR=desktop 目录（含 widget.html 等资源，同目录可写）
+#   exe ：APP_DIR=exe 所在目录（可写：日志/配置/成品 HTML）；RESOURCE_DIR=解包资源目录
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+else:
+    APP_DIR = Path(__file__).resolve().parent          # desktop 目录
+    RESOURCE_DIR = APP_DIR
+PARENT_DIR = APP_DIR.parent
+# 成品 HTML：源码形态由 refresh.py 生成在 agent-monitor 根；exe 形态在 exe 同目录
+HTML_PATH = (APP_DIR if getattr(sys, "frozen", False) else PARENT_DIR) / "AI-Agent监控台.html"
+WIDGET_HTML_PATH = RESOURCE_DIR / "widget.html"
+REFRESH_PY = (PARENT_DIR / "refresh.py") if not getattr(sys, "frozen", False) \
+    else (RESOURCE_DIR / "refresh.py")
 LOG_PATH = APP_DIR / "app.log"
 ICO_PATH = APP_DIR / "monitor.ico"
 SMOKE_PATH = APP_DIR / "smoke_result.json"
@@ -196,8 +211,45 @@ def build_icon_image():
 
 
 # ---------- 数据刷新 ----------
+def _run_refresh_inline() -> tuple:
+    """冻结（exe）形态：无外部 Python 可用，线程内加载打包的 refresh.py 执行数据管线。
+
+    refresh.py 的 die/SystemExit 转为 (False, 输出尾部)；print 经 redirect 捕获。
+    """
+    import contextlib
+    import importlib.util
+    import io
+    spec = importlib.util.spec_from_file_location("refresh_inline", REFRESH_PY)
+    if spec is None or spec.loader is None:
+        return False, "无法加载数据管线模块：%s" % REFRESH_PY
+    mod = importlib.util.module_from_spec(spec)
+    # refresh.py 的 OUTPUT_PATH 基于其模块目录（_MEIPASS 只读临时区）——
+    # 覆盖为 exe 目录，保证成品 HTML 写到用户可见位置
+    mod.OUTPUT_PATH = APP_DIR / "AI-Agent监控台.html"
+    buf = io.StringIO()
+    code = 0
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            spec.loader.exec_module(mod)     # 只装载定义（__main__ 守卫不触发）
+            try:
+                mod.main()
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+    except Exception as e:  # noqa: BLE001
+        return False, "数据管线异常：%r" % (e,)
+    return (code == 0), buf.getvalue()
+
+
 def run_refresh():
-    """调用上级目录 refresh.py。返回 (ok, 错误详情或空串)。"""
+    """执行数据刷新。源码形态：子进程调用 refresh.py；冻结形态：线程内 importlib。
+
+    返回 (ok, 错误详情或空串)。
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            return _run_refresh_inline()
+        except Exception as e:  # noqa: BLE001
+            return False, "内联刷新异常：%r" % (e,)
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"   # 子进程经管道输出统一 UTF-8，避免本地码页歧义
     try:

@@ -9,3 +9,8 @@ __pycache__/
 AI-Agent监控台.html
 brand/
 desktop/widget.json
+desktop/build/
+desktop/dist/
+desktop/__pycache__/
+desktop/monitor/__pycache__/
+AI-Agent监控台.exe
