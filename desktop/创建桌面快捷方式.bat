@@ -4,7 +4,7 @@ chcp 936 >nul
 setlocal
 cd /d "%~dp0"
 
-echo === AI Agent 监控台 - 创建桌面快捷方式 ===
+echo === GAUGE 衡 · AI Agent 监控台 - 创建桌面快捷方式 ===
 echo.
 
 if not exist "%~dp0monitor.ico" (
@@ -48,7 +48,7 @@ echo 工作目录: %WORKDIR%
 echo 图标:     %ICONFILE%
 echo.
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $desktop = [Environment]::GetFolderPath('Desktop'); $lnkPath = Join-Path $desktop 'AI Agent 监控台.lnk'; $lnk = $ws.CreateShortcut($lnkPath); $lnk.TargetPath = $env:PYWEXE; $lnk.Arguments = '\"' + $env:LAUNCHER + '\"'; $lnk.WorkingDirectory = $env:WORKDIR; $lnk.IconLocation = $env:ICONFILE + ',0'; $lnk.Save(); Write-Host ('[完成] 快捷方式已创建: ' + $lnkPath)"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $desktop = [Environment]::GetFolderPath('Desktop'); $lnkPath = Join-Path $desktop 'GAUGE 衡.lnk'; $lnk = $ws.CreateShortcut($lnkPath); $lnk.Description = 'GAUGE 衡 · AI Agent 监控台'; $lnk.TargetPath = $env:PYWEXE; $lnk.Arguments = '\"' + $env:LAUNCHER + '\"'; $lnk.WorkingDirectory = $env:WORKDIR; $lnk.IconLocation = $env:ICONFILE + ',0'; $lnk.Save(); Write-Host ('[完成] 快捷方式已创建: ' + $lnkPath)"
 if errorlevel 1 (
     echo [错误] 快捷方式创建失败。
     pause

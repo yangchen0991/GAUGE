@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py — AI Agent 监控台 Windows 桌面壳（v1.1.0，双进程架构）
+app.py — GAUGE 衡 · AI Agent 监控台 Windows 桌面壳（v1.2.0 入口层，双进程架构）
 
 为什么双进程：pystray 与 pywebview 同进程共存时，Shell_NotifyIcon(NIM_ADD) 在
 pywebview（pythonnet/CLR）环境中会静默失败（实测注册表 NotifyIconSettings 无条目），
 而独立进程同样用法注册成功。故按 pywebview 官方 pystray 示例的结构拆分：
 
 - 托盘主进程（本进程）：pystray icon.run() 占用主线程（pystray 设计场景）
-  · 单实例锁（127.0.0.1:59321）
-  · 托盘菜单：显示监控台 / 立即刷新 / 自动刷新间隔 / 桌面贴纸开关 / 贴纸设置
-    （鼠标穿透、透明度）/ 今日用量气泡 / 打开数据目录 / 退出
-  · 自动刷新线程（Event.wait 循环调用上级目录 refresh.py，只读数据库）
-  · 今日统计与贴纸数据包（今日 KPI + 7 天聚合 + 最近错误）推送给窗口子进程
+  · 单实例锁（127.0.0.1:59321，monitor.singleinst）
+  · 托盘菜单：显示监控台 / 立即刷新 / 自动刷新间隔 / 运行状态 / 桌面贴纸开关 /
+    贴纸设置（鼠标穿透、透明度、档位 Lite·Pro·Max）/ 今日用量气泡 / 官方用量页 /
+    打开数据目录 / 退出
+  · 自动刷新线程（Event.wait 循环调用上级目录 refresh.py，只读数据库，
+    monitor.refreshctl）
+  · 贴纸/托盘统计数据：优先消费 refresh.py 随成品 HTML 写出的 sidecar
+    （AI-Agent监控台.data.json，单一统计链，与网页同源同价目）；
+    sidecar 缺失/损坏时回退 monitor.stats 只读直查数据库
+    （--smoke 冒烟验证的就是 stats 直查链）
   · 对 Shell_NotifyIcon 的每次调用记录返回值（NIM_ADD 失败时自动重试一次并留日志）
-- 窗口子进程（spawn）：两个 webview 窗口
+- 窗口子进程（spawn）：两个 webview 窗口（入口 monitor.winchild.window_process_main；
+  必须位于可导入模块——frozen 形态下 spawn 按模块路径反序列化 target，
+  定义在 __main__ 会让子进程引导卡住）
   · 主面板：AI-Agent监控台.html；关闭窗口 = 隐藏到托盘（closing return False）
   · 桌面贴纸：widget.html，无边框+透明+置顶，Win11 DWM Acrylic 毛玻璃
     （DWMWA_SYSTEMBACKDROP_TYPE=38→3，主题事件重设时低频幂等重打），
@@ -23,6 +30,13 @@ pywebview（pythonnet/CLR）环境中会静默失败（实测注册表 NotifyIco
     WIDGET_CFG（穿透+透明度）/ WIDGET_DATA（统计数据注入渲染）
 - 退出：托盘菜单"退出" → 发 EXIT → 子进程销毁两窗口退出 → 主进程 join 后 icon.stop()
 - --smoke：冒烟模式（单进程，无托盘、无单实例锁），结果写 desktop/smoke_result.json
+
+monitor 包模块布局（依赖无环，批次3a 拆分）：
+  appenv（路径/常量/轮转日志）← singleinst（单实例锁）/ dialogs（预检与弹窗）
+  ← traycore（托盘状态/图标/通知/子进程发送）← refreshctl（刷新编排）；
+  winchild（窗口子进程：appenv + config + pin_desktop）。
+  本文件只保留：菜单 actions、build_menu/start_tray、run() 主流程、
+  --smoke 冒烟与 main()。
 """
 import os
 import sys
@@ -36,6 +50,8 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 # ---- PyInstaller 冻结环境：multiprocessing spawn 子进程引导必须最早接管 ----
+# frozen 子进程由本处 freeze_support 引导后，反序列化
+# monitor.winchild.window_process_main 作为 spawn target（必须可被子进程 import）
 if getattr(sys, "frozen", False):
     import multiprocessing
     multiprocessing.freeze_support()
@@ -43,325 +59,35 @@ if getattr(sys, "frozen", False):
 import json
 import logging
 import multiprocessing
-import socket
 import subprocess
 import threading
 import time
-import webbrowser
 from pathlib import Path
 
-from monitor.config import load_widget_cfg, save_widget_cfg
-from monitor.pin_desktop import pin_to_desktop, unpin_from_desktop
+from monitor.appenv import (
+    CHILD_JOIN_TIMEOUT, HTML_PATH, INTERVAL_CHOICES, PARENT_DIR, SINGLE_PORT,
+    SMOKE_PATH, WIDGET_OPACITY_CHOICES, WINDOW_TITLE, log, setup_logging,
+)
+from monitor.config import (
+    load_plan_tier, load_widget_cfg, validate_widget_settings,
+)
+from monitor.dialogs import error_dialog, webview2_dialog, webview2_installed
+from monitor.refreshctl import auto_refresh_loop, load_sidecar, refresh_once, run_refresh
+from monitor.singleinst import bind_single_instance, notify_existing_instance
 from monitor.stats import today_stats, tooltip_text, widget_stats
+from monitor.traycore import (
+    TRAY, _persist_widget_cfg, apply_widget_cfg, build_icon_image, child_send,
+    notify_user, tray_runtime_status,
+)
+from monitor.winchild import USAGE_PAGE_URL, window_process_main
 
 import pystray
 import webview
 
-# ---------- 路径与常量 ----------
-# 冻结（exe）与源码两种形态：
-#   源码：APP_DIR=desktop 目录（含 widget.html 等资源，同目录可写）
-#   exe ：APP_DIR=exe 所在目录（可写：日志/配置/成品 HTML）；RESOURCE_DIR=解包资源目录
-if getattr(sys, "frozen", False):
-    APP_DIR = Path(sys.executable).resolve().parent
-    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
-else:
-    APP_DIR = Path(__file__).resolve().parent          # desktop 目录
-    RESOURCE_DIR = APP_DIR
-PARENT_DIR = APP_DIR.parent
-# 成品 HTML：源码形态由 refresh.py 生成在 agent-monitor 根；exe 形态在 exe 同目录
-HTML_PATH = (APP_DIR if getattr(sys, "frozen", False) else PARENT_DIR) / "AI-Agent监控台.html"
-WIDGET_HTML_PATH = RESOURCE_DIR / "widget.html"
-REFRESH_PY = (PARENT_DIR / "refresh.py") if not getattr(sys, "frozen", False) \
-    else (RESOURCE_DIR / "refresh.py")
-LOG_PATH = APP_DIR / "app.log"
-ICO_PATH = APP_DIR / "monitor.ico"
-SMOKE_PATH = APP_DIR / "smoke_result.json"
-
-WINDOW_TITLE = "AI Agent 监控台"
-WIDGET_TITLE = "监控台贴纸"
-SINGLE_PORT = 59321
-REFRESH_TIMEOUT = 600          # 秒，与 refresh.py 的超时口径一致
-NOTIFY_MAX = 200               # 失败气泡最多展示 stderr 尾部 200 字
-CHILD_JOIN_TIMEOUT = 10        # 退出时等待窗口子进程的秒数
-WIDGET_SIZE = (340, 248)       # 贴纸逻辑尺寸（与 widget.html body 一致）
-WIDGET_DEFAULT_POS = (1400, 140)
-WIDGET_OPACITY_CHOICES = (("60%", 0.60), ("75%", 0.75), ("90%", 0.90))
-WIDGET_BACKDROP_MIN_BUILD = 22621   # DWMWA_SYSTEMBACKDROP_TYPE 的最低 Win11 build
-
-# 自动刷新间隔选项（label, 秒）；0 = 关闭。默认 5 分钟。
-INTERVAL_CHOICES = (("5 分钟", 300), ("15 分钟", 900), ("30 分钟", 1800), ("关闭", 0))
-
-WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
-# Edge WebView2 Runtime 的 EdgeUpdate Clients 键（HKLM WOW6432Node 与 HKCU 两处）
-WEBVIEW2_REG_SUB = (
-    r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients"
-    r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
-)
-
 _log = logging.getLogger("agent_monitor")
 
 
-def log(msg):
-    """写一条 INFO 日志（带进程前缀，双进程写同一 app.log）。"""
-    _log.info(msg)
-
-
-def setup_logging(tag=None):
-    """tag 用于区分窗口子进程日志（如 [win]），避免双进程日志无法归属。"""
-    handlers = []
-    try:
-        handlers.append(logging.FileHandler(LOG_PATH, encoding="utf-8", delay=True))
-    except Exception:
-        pass
-    if sys.stdout is not None:
-        try:
-            handlers.append(logging.StreamHandler(sys.stdout))
-        except Exception:
-            pass
-    prefix = ("[%s] " % tag) if tag else ""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%%(asctime)s [%%(levelname)s] %s%%(message)s" % prefix,
-        handlers=handlers,
-    )
-
-
-class _TrayState:
-    """托盘主进程状态。"""
-
-    def __init__(self):
-        self.icon = None
-        self.pipe = None                # 与窗口子进程的通信端
-        self.proc = None                # 窗口子进程
-        self.srv = None                 # 单实例监听 socket
-        self.stop_event = threading.Event()
-        self.refresh_wake = threading.Event()
-        self.refresh_lock = threading.Lock()
-        self.pipe_lock = threading.Lock()   # Pipe.send 的跨线程互斥
-        self.interval_secs = 300
-        self.child_exiting = False
-        self.widget_pinned = False
-        self.start_monotonic = 0.0       # 运行状态统计用
-        self.refresh_count = 0
-        self.refresh_secs_total = 0.0
-        # 桌面贴纸（配置真值在本进程；widget.json 是持久化镜像）
-        self.widget_visible = True
-        self.widget_passthrough = False
-        self.widget_opacity = 0.75
-        self.widget_pos = list(WIDGET_DEFAULT_POS)
-        self.widget_used = False        # 用户是否启用过贴纸（首次默认开）
-
-
-def apply_widget_cfg(cfg):
-    """把载入的贴纸配置字典应用到托盘状态（启动时与 widget.json 同步）。"""
-    TRAY.widget_visible = bool(cfg.get("visible", True))
-    TRAY.widget_passthrough = bool(cfg.get("passthrough", False))
-    TRAY.widget_pinned = bool(cfg.get("pinned", False))
-    TRAY.widget_opacity = float(cfg.get("opacity", 0.75))
-    TRAY.widget_pos = [int(cfg.get("x", WIDGET_DEFAULT_POS[0])),
-                       int(cfg.get("y", WIDGET_DEFAULT_POS[1]))]
-
-
-def _persist_widget_cfg() -> None:
-    """把当前托盘贴纸状态持久化到 widget.json（经由 monitor.config 原子写）。"""
-    if not save_widget_cfg({
-        "visible": TRAY.widget_visible,
-        "passthrough": TRAY.widget_passthrough,
-        "opacity": TRAY.widget_opacity,
-        "x": TRAY.widget_pos[0],
-        "y": TRAY.widget_pos[1],
-    }):
-        _log.exception("widget.json 写入失败")
-
-
-TRAY = _TrayState()
-
-
-# ---------- 托盘图标（PIL 运行时生成） ----------
-def build_icon_image():
-    """深蓝圆角方块 + 亮蓝三柱；同步保存 monitor.ico 供快捷方式使用。异常时纯色兜底。
-
-    性能注记：PIL._typing 会连带 import numpy，而 numpy 2.x 的 OpenBLAS 线程池
-    在多核机器（本机 24 逻辑核）按核预留提交内存，实测约 +740MB Private。
-    本应用不用 numpy/BLAS 数值计算，固定单线程即可消除该预留（实测 773→约 20MB）。
-    必须在首次 import PIL（进而 import numpy）之前设置。"""
-    try:
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-        os.environ.setdefault("OMP_NUM_THREADS", "1")
-        from PIL import Image, ImageDraw
-        img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.rounded_rectangle((6, 6, 250, 250), radius=52, fill=(27, 36, 56, 255))   # #1b2438
-        bar = (79, 140, 255, 255)                                                  # #4f8cff
-        d.rounded_rectangle((58, 146, 100, 206), radius=10, fill=bar)
-        d.rounded_rectangle((108, 96, 150, 206), radius=10, fill=bar)
-        d.rounded_rectangle((158, 50, 200, 206), radius=10, fill=bar)
-        try:
-            img.save(ICO_PATH, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (256, 256)])
-            log("托盘图标已保存：%s" % ICO_PATH)
-        except Exception:
-            _log.exception("monitor.ico 保存失败（不致命）")
-        return img
-    except Exception:
-        _log.exception("托盘图标生成失败，尝试纯色兜底")
-        try:
-            from PIL import Image
-            return Image.new("RGBA", (256, 256), (27, 36, 56, 255))
-        except Exception:
-            _log.exception("PIL 不可用，无法生成托盘图标")
-            return None
-
-
-# ---------- 数据刷新 ----------
-def _run_refresh_inline() -> tuple:
-    """冻结（exe）形态：无外部 Python 可用，线程内加载打包的 refresh.py 执行数据管线。
-
-    refresh.py 的 die/SystemExit 转为 (False, 输出尾部)；print 经 redirect 捕获。
-    """
-    import contextlib
-    import importlib.util
-    import io
-    spec = importlib.util.spec_from_file_location("refresh_inline", REFRESH_PY)
-    if spec is None or spec.loader is None:
-        return False, "无法加载数据管线模块：%s" % REFRESH_PY
-    mod = importlib.util.module_from_spec(spec)
-    # refresh.py 的 OUTPUT_PATH 基于其模块目录（_MEIPASS 只读临时区）——
-    # 覆盖为 exe 目录，保证成品 HTML 写到用户可见位置
-    mod.OUTPUT_PATH = APP_DIR / "AI-Agent监控台.html"
-    buf = io.StringIO()
-    code = 0
-    try:
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            spec.loader.exec_module(mod)     # 只装载定义（__main__ 守卫不触发）
-            try:
-                mod.main()
-            except SystemExit as e:
-                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
-    except Exception as e:  # noqa: BLE001
-        return False, "数据管线异常：%r" % (e,)
-    return (code == 0), buf.getvalue()
-
-
-def run_refresh():
-    """执行数据刷新。源码形态：子进程调用 refresh.py；冻结形态：线程内 importlib。
-
-    返回 (ok, 错误详情或空串)。
-    """
-    if getattr(sys, "frozen", False):
-        try:
-            return _run_refresh_inline()
-        except Exception as e:  # noqa: BLE001
-            return False, "内联刷新异常：%r" % (e,)
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"   # 子进程经管道输出统一 UTF-8，避免本地码页歧义
-    try:
-        r = subprocess.run(
-            [sys.executable, str(REFRESH_PY)],
-            cwd=str(PARENT_DIR),
-            capture_output=True,
-            timeout=REFRESH_TIMEOUT,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "刷新超时（>%d 秒）" % REFRESH_TIMEOUT
-    except Exception as e:  # noqa: BLE001
-        return False, "无法启动刷新进程：%r" % (e,)
-    if r.returncode != 0:
-        tail = (r.stderr or b"").decode("utf-8", "replace").strip()
-        if len(tail) > NOTIFY_MAX:
-            tail = tail[-NOTIFY_MAX:]
-        return False, tail or ("刷新进程退出码 %d" % r.returncode)
-    return True, ""
-
-
-def child_send(cmd):
-    """向窗口子进程发送命令。返回是否成功。"""
-    pipe = TRAY.pipe
-    if pipe is None:
-        return False
-    try:
-        with TRAY.pipe_lock:
-            pipe.send(cmd)
-        return True
-    except Exception:
-        _log.exception("发送命令 %r 失败（窗口子进程可能已退出）", cmd)
-        return False
-
-
-def refresh_tooltip():
-    """数据刷新成功后刷新托盘悬停提示。"""
-    icon = TRAY.icon
-    if icon is None:
-        return
-    try:
-        icon.title = tooltip_text()
-        log("托盘提示已更新")
-    except Exception:
-        _log.exception("更新托盘提示失败")
-
-
-def refresh_once(reason):
-    """执行一次刷新（防重入）。成功静默 + 通知子进程重载页面；失败弹气泡。"""
-    if not TRAY.refresh_lock.acquire(blocking=False):
-        log("刷新已在进行，跳过本次请求（%s）" % reason)
-        return
-    try:
-        t0 = time.monotonic()
-        ok, detail = run_refresh()
-        elapsed = time.monotonic() - t0
-        if ok:
-            log("刷新成功（%s，耗时 %.1fs）" % (reason, elapsed))
-            TRAY.refresh_count += 1
-            TRAY.refresh_secs_total += elapsed
-            refresh_tooltip()
-            if child_send("RELOAD"):
-                log("已通知窗口重载最新数据")
-            child_send(("WIDGET_DATA", widget_stats()))
-            log("已推送贴纸数据")
-        else:
-            log("刷新失败（%s，耗时 %.1fs）：%s" % (reason, elapsed, detail))
-            notify_user("数据刷新失败", detail or "未知错误")
-    finally:
-        TRAY.refresh_lock.release()
-
-
-def auto_refresh_loop():
-    """自动刷新后台线程：按当前间隔循环触发刷新；间隔切换或退出经 Event 立即唤醒。"""
-    log("自动刷新线程运行中（当前间隔 %d 秒）" % TRAY.interval_secs)
-    while not TRAY.stop_event.is_set():
-        iv = TRAY.interval_secs
-        if iv <= 0:
-            # 自动刷新已关闭：挂起，直到间隔被重新设置
-            TRAY.refresh_wake.wait()
-            TRAY.refresh_wake.clear()
-            continue
-        fired = TRAY.refresh_wake.wait(iv)
-        TRAY.refresh_wake.clear()
-        if TRAY.stop_event.is_set():
-            break
-        if fired:
-            # 间隔被切换：立即按新间隔重新计时（不触发刷新）
-            continue
-        refresh_once("auto")
-    log("自动刷新线程退出")
-
-
-# ---------- 托盘 ----------
-def notify_user(title, message):
-    """托盘气泡通知（平台不支持或托盘不可用时静默降级为日志）。"""
-    icon = TRAY.icon
-    if icon is None:
-        log("托盘不可用，气泡未发送：%s | %s" % (title, message))
-        return
-    try:
-        if not icon.HAS_NOTIFICATION:
-            log("当前平台不支持气泡通知：%s | %s" % (title, message))
-            return
-        icon.notify((message or "")[:NOTIFY_MAX], title)
-    except Exception:
-        _log.exception("气泡通知失败")
-
-
+# ---------- 托盘间隔/菜单辅助 ----------
 def set_interval(secs):
     """切换自动刷新间隔并立即生效（唤醒计时线程按新间隔重排）。"""
     TRAY.interval_secs = secs
@@ -382,8 +108,15 @@ def update_menu():
 
 
 def tray_notify(icon, item):
-    """托盘菜单「今日用量气泡」：读取今日统计并以气泡展示。"""
-    st = today_stats()
+    """托盘菜单「今日用量气泡」：优先 sidecar 今日包，缺失回退 stats 直查
+    （与 refresh_tooltip 同模式——桌面单一统计链的最后一条直查链改造）。"""
+    sc = load_sidecar()
+    if sc is not None:
+        st = sc["today"]
+        log("今日用量气泡（sidecar）")
+    else:
+        st = today_stats()
+        log("sidecar 不可用，今日用量气泡回退直查")
     if "error" in st:
         notify_user("今日用量", "数据读取失败：%s" % st["error"])
     else:
@@ -399,6 +132,14 @@ def tray_open_dir(icon, item):
             subprocess.Popen(["explorer", str(PARENT_DIR)])
         except Exception:
             _log.exception("打开数据目录失败")
+
+
+def tray_open_usage(icon, item):
+    """托盘菜单「官方用量页」：默认浏览器打开 Coding Plan 用量页（与贴纸 ↗ 同 URL）。"""
+    try:
+        os.startfile(USAGE_PAGE_URL)
+    except Exception:
+        _log.exception("打开官方用量页失败：%s" % USAGE_PAGE_URL)
 
 
 def tray_exit(icon, item):
@@ -440,8 +181,7 @@ def toggle_widget(icon, item):
 def toggle_passthrough(icon, item):
     """托盘「鼠标穿透」开关：切换整窗点击穿透并持久化配置（开启时气泡提示）。"""
     TRAY.widget_passthrough = not TRAY.widget_passthrough
-    child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
-                               "opacity": TRAY.widget_opacity}))
+    child_send(("WIDGET_CFG", _widget_cfg_payload()))
     _persist_widget_cfg()
     update_menu()
     log("贴纸鼠标穿透切换为 %s" % ("开" if TRAY.widget_passthrough else "关"))
@@ -459,37 +199,74 @@ def toggle_pinned(icon, item):
     child_send(("WIDGET_PIN", not TRAY.widget_pinned))
 
 
-def tray_runtime_status(icon, item):
-    """托盘「运行状态」气泡：运行时长/两进程内存/刷新统计（psutil）。"""
-    import psutil
-    lines = []
-    if TRAY.start_monotonic:
-        up = time.monotonic() - TRAY.start_monotonic
-        lines.append("运行时长 %d 分 %02d 秒" % (up // 60, up % 60))
-    try:
-        me = psutil.Process(os.getpid()).memory_info()
-        lines.append("托盘进程 %.1f MB" % (me.rss / 1048576.0))
-        if TRAY.proc is not None and TRAY.proc.is_alive():
-            ch = psutil.Process(TRAY.proc.pid).memory_info()
-            lines.append("窗口进程 %.1f MB" % (ch.rss / 1048576.0))
-    except Exception:
-        lines.append("内存信息不可用")
-    if TRAY.refresh_count:
-        lines.append("刷新 %d 次 · 平均 %.2f 秒"
-                     % (TRAY.refresh_count, TRAY.refresh_secs_total / TRAY.refresh_count))
-    else:
-        lines.append("尚未刷新")
-    notify_user("运行状态", chr(10).join(lines))
-
-
 def set_widget_opacity(value):
     """设置贴纸透明度（托盘菜单三档单选）并持久化到 widget.json。"""
     TRAY.widget_opacity = value
-    child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
-                               "opacity": TRAY.widget_opacity}))
+    child_send(("WIDGET_CFG", _widget_cfg_payload()))
     _persist_widget_cfg()
     update_menu()
     log("贴纸透明度切换为 %d%%" % round(value * 100))
+
+
+def _widget_cfg_payload():
+    """构造主进程反馈给贴纸的完整可编辑设置集合。"""
+    return {
+        "opacity": TRAY.widget_opacity,
+        "pinned": TRAY.widget_pinned,
+        "passthrough": TRAY.widget_passthrough,
+    }
+
+
+def handle_widget_settings_request(settings):
+    """处理窗口子进程的结构化设置请求。
+
+    主进程在这里再次执行白名单验证并负责持久化；pinned 仍沿用原有
+    WIDGET_PIN → WIDGET_PIN_RESULT 的异步原生确认链，失败时由结果分支
+    回传当前真值。返回 False 表示请求被拒绝。
+    """
+    clean = validate_widget_settings(settings)
+    if clean is None:
+        log("拒绝非法贴纸设置请求：%r" % (settings,))
+        child_send(("WIDGET_CFG", _widget_cfg_payload()))
+        return False
+    if "opacity" in clean:
+        TRAY.widget_opacity = clean["opacity"]
+    if "passthrough" in clean:
+        TRAY.widget_passthrough = clean["passthrough"]
+    if "opacity" in clean or "passthrough" in clean:
+        _persist_widget_cfg()
+    # 先同步已确认的配置；pinned 待原生确认后再反馈最终值。
+    child_send(("WIDGET_CFG", _widget_cfg_payload()))
+    if "pinned" in clean and clean["pinned"] != TRAY.widget_pinned:
+        child_send(("WIDGET_PIN", clean["pinned"]))
+    update_menu()
+    log("已处理贴纸设置请求：%s" % clean)
+    return True
+
+
+def set_widget_tier(tier):
+    """切换贴纸档位（Lite/Pro/Max，积分窗口额度随之变化）并持久化 plan_tier。
+
+    走既有保存管线（_persist_widget_cfg 携带 plan_tier，任何后续保存不再丢档位），
+    随后触发一次刷新：refresh.py 会按新档位重新生成 sidecar 的 plan 窗口字段，
+    并经 refresh_once 的既有推送链把新数据注入贴纸。
+    """
+    TRAY.widget_plan_tier = tier
+    _persist_widget_cfg()
+    threading.Thread(target=refresh_once, args=("tier",), daemon=True,
+                     name="tier-refresh").start()
+    update_menu()
+    log("贴纸档位切换为 %s" % tier)
+
+
+def _tier_item(label, tier):
+    """档位单选项工厂（radio 组；勾选态读 config.load_plan_tier()，与文件真值一致）。"""
+    return pystray.MenuItem(
+        label,
+        lambda icon, item: set_widget_tier(tier),
+        radio=True,
+        checked=lambda item: load_plan_tier() == tier,
+    )
 
 
 def _opacity_item(label, value):
@@ -520,6 +297,12 @@ def build_menu():
             pystray.Menu(*[_opacity_item(label, v)
                            for label, v in WIDGET_OPACITY_CHOICES]),
         ),
+        pystray.MenuItem(
+            "档位",
+            pystray.Menu(_tier_item("Lite", "lite"),
+                         _tier_item("Pro", "pro"),
+                         _tier_item("Max", "max")),
+        ),
     )
     return pystray.Menu(
         pystray.MenuItem("显示监控台", lambda icon, item: child_send("SHOW"), default=True),
@@ -533,12 +316,14 @@ def build_menu():
             "自动刷新间隔",
             pystray.Menu(*[_interval_item(label, secs) for label, secs in INTERVAL_CHOICES]),
         ),
+        pystray.MenuItem("运行状态", tray_runtime_status),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("桌面贴纸", toggle_widget,
                          checked=lambda item: TRAY.widget_visible),
         pystray.MenuItem("贴纸设置", widget_submenu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("今日用量气泡", tray_notify),
+        pystray.MenuItem("官方用量页", tray_open_usage),
         pystray.MenuItem("打开数据目录", tray_open_dir),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("退出", tray_exit),
@@ -592,8 +377,12 @@ def start_tray():
         log("托盘图标不可用，跳过托盘（窗口功能不受影响）")
         error_dialog("托盘图标生成失败（PIL 不可用），无法启动。\n详情见 desktop\\app.log")
         return None
+    # 初始标题优先 sidecar：启动兜底刷新刚跑完时 sidecar 已存在且与网页同源
+    sc0 = load_sidecar()
     TRAY.icon = pystray.Icon(
-        "agent-monitor", icon=icon_img, title=tooltip_text(), menu=build_menu()
+        "agent-monitor", icon=icon_img,
+        title=tooltip_text(sc0["today"]) if sc0 is not None else tooltip_text(),
+        menu=build_menu()
     )
     try:
         # 预构建菜单：让 checked/action 签名错误在这里显式暴露，
@@ -605,432 +394,6 @@ def start_tray():
         return None
     log("托盘初始化完成（icon.run 将在主线程运行）")
     return TRAY.icon
-
-
-# ---------- 窗口子进程 ----------
-class _WindowState:
-    """窗口子进程状态：主面板与贴纸两个窗口对象、就绪事件、退出标志与贴纸配置缓存。"""
-
-    def __init__(self):
-        self.window = None            # 主面板窗口
-        self.widget = None            # 桌面贴纸窗口
-        self.window_ready = threading.Event()
-        self.widget_ready = threading.Event()
-        self.widget_native_hwnd = None
-        self.exiting = False
-        self.cfg = {"visible": True, "passthrough": False, "opacity": 0.75,
-                    "x": WIDGET_DEFAULT_POS[0], "y": WIDGET_DEFAULT_POS[1]}
-        self._pos_timer = None
-        self._pos_lock = threading.Lock()
-
-
-def on_loaded(state):
-    """主面板 loaded 事件：标记窗口就绪并留日志。"""
-    state.window_ready.set()
-    log("页面加载完成：%s" % HTML_PATH.name)
-
-
-def on_closing(state):
-    """关闭窗口 = 隐藏到托盘（return False 取消关闭）。退出流程中放行。"""
-    if state.exiting:
-        return None
-    log("[win] 窗口关闭请求 → 隐藏到托盘")
-    try:
-        w = state.window
-        if w is not None:
-            w.hide()
-    except Exception:
-        _log.exception("[win] 隐藏窗口失败")
-    return False
-
-
-# ---- Win32：毛玻璃与鼠标穿透（仅贴纸窗口；失效自动降级） ----
-def _win_hwnd(window):
-    """取 pywebview 窗口的 Win32 句柄（native 为 WinForms BrowserForm）。
-
-    native.Handle 是 .NET IntPtr，须经 ToInt64() 转 int（直接 int() 会 TypeError）。
-    """
-    try:
-        native = getattr(window, "native", None)
-        if native is None:
-            return None
-        handle = getattr(native, "Handle", None)
-        if handle is None:
-            return None
-        try:
-            return int(handle.ToInt64())
-        except AttributeError:
-            return int(handle)
-    except Exception:
-        return None
-
-
-def apply_acrylic_backdrop(hwnd):
-    """Win11 22621+：DWMWA_SYSTEMBACKDROP_TYPE=3（Acrylic）+ 暗色 + sheet-of-glass。
-
-    注意：pywebview 会在系统主题变化事件时把 38 号属性重设（dark→2/light→1），
-    因此该函数需要低频幂等重调（数据注入/窗口 shown 时）。
-    返回 True=已设置；False=环境不支持（调用方应加深 CSS 背景降级）。
-    """
-    try:
-        if sys.getwindowsversion().build < WIDGET_BACKDROP_MIN_BUILD:
-            return False
-        import ctypes
-        d = ctypes.windll.dwmapi
-        hwnd = int(hwnd)
-
-        class MARGINS(ctypes.Structure):
-            _fields_ = [("cxLeftWidth", ctypes.c_int), ("cxRightWidth", ctypes.c_int),
-                        ("cyTopHeight", ctypes.c_int), ("cyBottomHeight", ctypes.c_int)]
-
-        backdrop = ctypes.c_int(3)      # DWMSBT_TRANSIENTWINDOW → Acrylic
-        dark = ctypes.c_int(1)          # DWMWA_USE_IMMERSIVE_DARK_MODE
-        d.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop), 4)
-        d.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), 4)
-        margins = MARGINS(-1, -1, -1, -1)   # sheet of glass
-        d.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(margins))
-        return True
-    except Exception:
-        _log.exception("[win] 毛玻璃设置失败（降级为深色实底）")
-        return False
-
-
-GWL_EXSTYLE = -20
-WS_EX_LAYERED = 0x00080000
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_NOACTIVATE = 0x08000000
-CLICK_THROUGH_MASK = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
-
-
-def set_click_through(hwnd, on):
-    """整窗鼠标穿透开关（WS_EX_TRANSPARENT 是 all-or-nothing）。"""
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
-        hwnd = int(hwnd)
-        old = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        new = (old | CLICK_THROUGH_MASK) if on else (old & ~CLICK_THROUGH_MASK)
-        if new != old:
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
-        return True
-    except Exception:
-        _log.exception("[win] 鼠标穿透切换失败")
-        return False
-
-
-class WidgetApi:
-    """贴纸页面的 js_api：展开主面板 / 隐藏贴纸 / 原生拖动。"""
-
-    def __init__(self, state):
-        self._state = state
-
-    def open_main(self):
-        """展开主面板窗口（贴纸「展开」按钮）。"""
-        try:
-            if self._state.window is not None:
-                self._state.window.show()
-            return True
-        except Exception:
-            _log.exception("[win] open_main 失败")
-            return False
-
-    def hide_widget(self):
-        """隐藏贴纸（页面侧触发，同步托盘菜单勾选状态）。"""
-        try:
-            if self._state.widget is not None:
-                self._state.widget.hide()
-            pipe = _CHILD_PIPE[0]
-            if pipe is not None:
-                with _CHILD_PIPE_LOCK:
-                    pipe.send("WIDGET_STATE:hidden")
-            return True
-        except Exception:
-            _log.exception("[win] hide_widget 失败")
-            return False
-
-    def start_drag(self):
-        """经典无边框窗口拖动：WM_NCLBUTTONDOWN+HTCAPTION 交给 Windows 原生
-        拖动循环（在 js_api 调用线程内模态阻塞，直到用户松开鼠标）。"""
-        try:
-            hwnd = self._state.widget_native_hwnd or _win_hwnd(self._state.widget)
-            if not hwnd:
-                return False
-            import ctypes
-            WM_NCLBUTTONDOWN, HTCAPTION = 0xA1, 2
-            ctypes.windll.user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
-            return True
-        except Exception:
-            _log.exception("[win] start_drag 失败")
-            return False
-
-
-# 子进程侧持有自己的 pipe 引用（js_api 回调里需要反向通知主进程）
-_CHILD_PIPE = [None]
-_CHILD_PIPE_LOCK = threading.Lock()
-
-
-def _widget_moved_debounced(state, x, y):
-    """贴纸拖动结束后的位置回传（500ms 去抖）。"""
-    def flush():
-        try:
-            pipe = _CHILD_PIPE[0]
-            if pipe is not None:
-                with _CHILD_PIPE_LOCK:
-                    pipe.send(["WIDGET_POS", int(x), int(y)])
-        except Exception:
-            pass
-    with state._pos_lock:
-        if state._pos_timer is not None:
-            state._pos_timer.cancel()
-        state._pos_timer = threading.Timer(0.5, flush)
-        state._pos_timer.daemon = True
-        state._pos_timer.start()
-
-
-def _widget_backdrop_retry(state, attempts=6):
-    """loaded 事件时 native 可能尚未就绪：短间隔重试取 hwnd 并应用毛玻璃。"""
-    counter = [attempts]
-
-    def attempt():
-        hwnd = _win_hwnd(state.widget)
-        counter[0] -= 1
-        log("[win] 毛玻璃重试 %d/6：hwnd=%s" % (attempts - counter[0], "OK" if hwnd else "未就绪"))
-        if hwnd:
-            state.widget_native_hwnd = hwnd
-            ok = apply_acrylic_backdrop(hwnd)
-            if not ok:
-                try:
-                    state.widget.evaluate_js(
-                        "document.getElementById('widget').style.background='rgba(13,18,32,.93)';"
-                        "document.getElementById('widget').style.backdropFilter='none';"
-                    )
-                    log("[win] 毛玻璃不可用，已降级为深色实底")
-                except Exception:
-                    pass
-            else:
-                log("[win] 毛玻璃（DWM Acrylic）已应用")
-            if state.cfg.get("passthrough"):
-                set_click_through(hwnd, True)
-            return
-        if counter[0] > 0:
-            t = threading.Timer(1.0, attempt)
-            t.daemon = True
-            t.start()
-        else:
-            log("[win] 贴纸窗口句柄始终未就绪，毛玻璃跳过")
-
-    threading.Timer(0.8, attempt).start()
-
-
-def on_widget_loaded(state):
-    """贴纸 loaded 事件：应用毛玻璃/穿透/透明度；native 未就绪时转入延迟重试。"""
-    state.widget_ready.set()
-    log("[win] 贴纸页面加载完成")
-    hwnd = _win_hwnd(state.widget)
-    if hwnd:
-        state.widget_native_hwnd = hwnd
-        ok = apply_acrylic_backdrop(hwnd)
-        if not ok:
-            # 毛玻璃不可用（非 Win11 22621+ 等）：加深 CSS 背景保证可读性
-            try:
-                state.widget.evaluate_js(
-                    "document.getElementById('widget').style.background='rgba(13,18,32,.93)';"
-                    "document.getElementById('widget').style.backdropFilter='none';"
-                )
-                log("[win] 毛玻璃不可用，已降级为深色实底")
-            except Exception:
-                pass
-        else:
-            log("[win] 毛玻璃（DWM Acrylic）已应用")
-    else:
-        _widget_backdrop_retry(state)   # native 未就绪：延迟重试
-    if state.cfg.get("passthrough"):
-        if hwnd:
-            set_click_through(hwnd, True)
-    try:
-        state.widget.evaluate_js(
-            "document.getElementById('widget').style.opacity=%r;"
-            % float(state.cfg.get("opacity", 0.75))
-        )
-    except Exception:
-        pass
-
-
-def on_widget_shown(state):
-    """贴纸 shown 事件：重打 DWM backdrop（窗口重新显示后可能被系统重置）。"""
-    # pywebview 会在主题变化时重设 backdrop，show 时重打一次
-    hwnd = state.widget_native_hwnd or _win_hwnd(state.widget)
-    if hwnd:
-        state.widget_native_hwnd = hwnd
-        apply_acrylic_backdrop(hwnd)
-
-
-def _window_cmd_loop(state, pipe):
-    """webview.start 回调（子线程）：处理主进程命令。
-
-    协议：str 命令（SHOW/RELOAD/EXIT）或 tuple（CMD, payload）：
-      ("WIDGET_SHOW", None) / ("WIDGET_HIDE", None)
-      ("WIDGET_CFG", {"passthrough":bool,"opacity":float})
-      ("WIDGET_DATA", stats_dict)
-    子→主反向消息：["WIDGET_POS", x, y]（拖动去抖）、"WIDGET_STATE:hidden"。
-    """
-    while True:
-        try:
-            if not pipe.poll(0.3):
-                continue
-            msg = pipe.recv()
-        except (EOFError, OSError):
-            log("[win] 与主进程的管道断开（主进程退出），窗口随之退出")
-            state.exiting = True
-            try:
-                state.window.destroy()
-            except Exception:
-                pass
-            return
-        except Exception:
-            _log.exception("[win] 命令接收异常")
-            continue
-
-        cmd, payload = (msg if isinstance(msg, tuple) else (msg, None))
-
-        if cmd == "SHOW":
-            log("[win] 收到 SHOW → 显示窗口")
-            try:
-                state.window.show()
-            except Exception:
-                _log.exception("[win] 显示窗口失败")
-        elif cmd == "RELOAD":
-            log("[win] 收到 RELOAD → 重载页面")
-            try:
-                state.window.evaluate_js("location.reload()")
-            except Exception:
-                _log.exception("[win] 页面重载失败")
-        elif cmd == "EXIT":
-            log("[win] 收到 EXIT → 销毁窗口退出")
-            state.exiting = True
-            try:
-                state.window.destroy()
-            except Exception:
-                _log.exception("[win] 销毁窗口失败")
-            try:
-                if state.widget is not None:
-                    state.widget.destroy()
-            except Exception:
-                pass
-            return
-        elif cmd == "WIDGET_SHOW":
-            log("[win] 收到 WIDGET_SHOW → 显示贴纸")
-            try:
-                state.widget.show()
-                on_widget_shown(state)
-            except Exception:
-                _log.exception("[win] 显示贴纸失败")
-        elif cmd == "WIDGET_HIDE":
-            log("[win] 收到 WIDGET_HIDE → 隐藏贴纸")
-            try:
-                state.widget.hide()
-            except Exception:
-                _log.exception("[win] 隐藏贴纸失败")
-        elif cmd == "WIDGET_PIN":
-            want = bool(payload)
-            hwnd = state.widget_native_hwnd or _win_hwnd(state.widget)
-            ok = False
-            if hwnd:
-                ok = pin_to_desktop(hwnd) if want else unpin_from_desktop(hwnd, keep_on_top=True)
-            log("[win] WIDGET_PIN=%s → %s" % (want, "成功" if ok else "失败"))
-            with _CHILD_PIPE_LOCK:
-                pipe.send(["WIDGET_PIN_RESULT", want, ok])
-        elif cmd == "WIDGET_CFG":
-            if isinstance(payload, dict):
-                state.cfg.update(payload)
-                hwnd = state.widget_native_hwnd or _win_hwnd(state.widget)
-                if hwnd:
-                    set_click_through(hwnd, bool(state.cfg.get("passthrough")))
-                try:
-                    state.widget.evaluate_js(
-                        "document.getElementById('widget').style.opacity=%r;"
-                        % float(state.cfg.get("opacity", 0.75))
-                    )
-                except Exception:
-                    pass
-                log("[win] 贴纸配置已应用：%s" % payload)
-        elif cmd == "WIDGET_DATA":
-            if isinstance(payload, dict):
-                try:
-                    state.widget_ready.wait(5)   # 页面未就绪时等待，避免注入丢失
-                    state.widget.evaluate_js(
-                        "renderWidget(%s);" % json.dumps(payload, ensure_ascii=False)
-                    )
-                    log("[win] 贴纸数据已注入")
-                except Exception:
-                    _log.exception("[win] 贴纸数据注入失败")
-        else:
-            log("[win] 忽略未知命令：%r" % (msg,))
-
-
-def window_process_main(pipe, widget_cfg=None):
-    """窗口子进程入口（spawn）：创建主窗口与贴纸窗口并服务命令循环。
-
-    正常返回 0（收到 EXIT 或主进程管道关闭）；主窗口创建失败返回 1。
-    """
-    setup_logging("win")
-    log("[win] 窗口子进程启动（python=%s）" % sys.version.split()[0])
-    state = _WindowState()
-    if isinstance(widget_cfg, dict):
-        state.cfg.update(widget_cfg)
-
-    try:
-        window = webview.create_window(
-            WINDOW_TITLE,
-            HTML_PATH.as_uri(),
-            width=1280,
-            height=820,
-            min_size=(960, 600),
-        )
-        _CHILD_PIPE[0] = pipe
-        state.widget = webview.create_window(
-            WIDGET_TITLE,
-            WIDGET_HTML_PATH.as_uri(),
-            width=WIDGET_SIZE[0],
-            height=WIDGET_SIZE[1],
-            x=state.cfg.get("x", WIDGET_DEFAULT_POS[0]),
-            y=state.cfg.get("y", WIDGET_DEFAULT_POS[1]),
-            frameless=True,
-            transparent=True,
-            on_top=True,
-            hidden=not state.cfg.get("visible", True),
-            js_api=WidgetApi(state),
-        )
-    except Exception as e:  # noqa: BLE001
-        _log.exception("[win] 创建窗口失败")
-        log("[win] FATAL: %r（可能缺少 Microsoft Edge WebView2 Runtime）" % (e,))
-        return 1
-
-    state.window = window
-    window.events.loaded += lambda: on_loaded(state)
-    window.events.closing += lambda: on_closing(state)
-    state.widget.events.loaded += lambda: on_widget_loaded(state)
-    state.widget.events.shown += lambda: on_widget_shown(state)
-
-    def on_widget_moved():
-        try:
-            _widget_moved_debounced(state, int(state.widget.x), int(state.widget.y))
-        except Exception:
-            pass
-
-    state.widget.events.moved += on_widget_moved
-
-    threading.Thread(
-        target=_window_cmd_loop, args=(state, pipe), daemon=True, name="cmd-loop"
-    ).start()
-
-    try:
-        webview.start()
-    except Exception:
-        _log.exception("[win] GUI 主循环异常退出")
-        return 1
-    log("[win] GUI 主循环结束，窗口子进程退出")
-    return 0
 
 
 def child_watch_loop(proc):
@@ -1048,108 +411,6 @@ def child_watch_loop(proc):
             icon.stop()
         except Exception:
             pass
-
-
-# ---------- 单实例 ----------
-def bind_single_instance():
-    """绑定 127.0.0.1:59321 并监听 SHOW 指令；绑定失败返回 None。"""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        srv.bind(("127.0.0.1", SINGLE_PORT))
-        srv.listen(4)
-    except OSError:
-        try:
-            srv.close()
-        except OSError:
-            pass
-        return None
-
-    def accept_loop():
-        while True:
-            try:
-                conn, _ = srv.accept()
-            except OSError:
-                break
-            try:
-                data = conn.recv(16)
-                conn.close()
-            except OSError:
-                continue
-            if data.strip().upper().startswith(b"SHOW"):
-                log("收到 SHOW 指令 → 转发给窗口子进程")
-                child_send("SHOW")
-
-    threading.Thread(target=accept_loop, daemon=True, name="single-instance").start()
-    return srv
-
-
-def notify_existing_instance():
-    """单实例协议：通知已运行实例唤出窗口。返回是否发送成功。"""
-    try:
-        with socket.create_connection(("127.0.0.1", SINGLE_PORT), timeout=2) as c:
-            c.sendall(b"SHOW")
-        return True
-    except OSError:
-        return False
-
-
-# ---------- WebView2 检测 ----------
-def webview2_installed():
-    """True=已安装 / False=明确未安装 / None=不确定（异常一律按不确定）。"""
-    try:
-        import winreg
-        found_key = False
-        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            try:
-                with winreg.OpenKey(root, WEBVIEW2_REG_SUB) as k:
-                    found_key = True
-                    pv, _ = winreg.QueryValueEx(k, "pv")
-                    s = str(pv).strip()
-                    if s and s != "0.0.0.0":
-                        return True
-            except OSError:
-                continue
-        return None if found_key else False
-    except Exception:
-        return None
-
-
-def webview2_dialog(missing):
-    """WebView2 缺失提示（tkinter 弹窗 + 可选打开官方下载页）。仅在托盘主进程调用。"""
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            if missing:
-                msg = ("未检测到 Microsoft Edge WebView2 Runtime。\n\n"
-                       "「AI Agent 监控台」需要 WebView2 渲染界面。\n"
-                       "是否现在打开微软官方下载页？")
-            else:
-                msg = ("创建主窗口失败，可能缺少 Microsoft Edge WebView2 Runtime。\n\n"
-                       "是否打开微软官方下载页安装后重试？")
-            if messagebox.askyesno(WINDOW_TITLE, msg):
-                webbrowser.open(WEBVIEW2_URL)
-        finally:
-            root.destroy()
-    except Exception:
-        _log.exception("WebView2 提示弹窗失败")
-
-
-def error_dialog(msg):
-    """错误弹窗（tkinter，仅托盘主进程调用；不阻断非交互场景）。"""
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            messagebox.showerror(WINDOW_TITLE, msg)
-        finally:
-            root.destroy()
-    except Exception:
-        _log.exception("错误弹窗失败")
 
 
 # ---------- 冒烟模式（单进程，无托盘） ----------
@@ -1253,17 +514,38 @@ def child_msg_loop(pipe):
             want, ok = bool(msg[1]), bool(msg[2])
             TRAY.widget_pinned = want if ok else False
             _persist_widget_cfg()
+            child_send(("WIDGET_CFG", _widget_cfg_payload()))
             update_menu()
             if not ok:
                 notify_user("钉桌面", "当前系统不支持钉桌面模式，已保持置顶悬浮。")
             log("钉桌面切换为 %s（结果 %s）" % ("开" if TRAY.widget_pinned else "关", ok))
+        elif isinstance(msg, list) and msg[:1] == ["WIDGET_SETTINGS"] and len(msg) >= 2:
+            handle_widget_settings_request(msg[1])
+        elif isinstance(msg, list) and msg[:1] == ["WIDGET_CLOSED"]:
+            # 贴纸窗口被销毁（Alt+F4 / WM_CLOSE）：同步显隐状态并落盘；
+            # 下次托盘「桌面贴纸」开关经 WIDGET_SHOW 触发 winchild 重建窗口。
+            # R4-P1-1 防御：应用退出序列中的销毁不落盘（复用既有 child_exiting/
+            # stop_event 标志，未新增状态）。
+            TRAY.widget_visible = False
+            if TRAY.child_exiting or TRAY.stop_event.is_set():
+                log("退出期间贴纸窗口关闭，跳过 widget.json 持久化")
+            else:
+                _persist_widget_cfg()
+                update_menu()
+                log("贴纸窗口已关闭，widget_visible=False 已落盘")
+        elif msg == "WIDGET_REFRESH_NOW":
+            # 贴纸 ↻ 按钮（winchild.WidgetApi.refresh_now）：走既有刷新链，成功后
+            # refresh_once 会自动把新 sidecar/直查数据推送回贴纸。
+            log("贴纸请求立即刷新（WIDGET_REFRESH_NOW）")
+            threading.Thread(target=refresh_once, args=("widget",), daemon=True,
+                             name="widget-refresh").start()
 
 
 def run():
     """托盘主进程主流程：单实例锁 → 成品 HTML 兜底 → WebView2 预检 → 托盘初始化 →
         窗口子进程 → 初始数据推送 → 消息循环 → 退出清理。返回进程退出码。"""
-    # 单实例锁
-    srv = bind_single_instance()
+    # 单实例锁（SHOW 指令经 child_send 转发给窗口子进程）
+    srv = bind_single_instance(child_send)
     if srv is None:
         ok = notify_existing_instance()
         log("已有实例运行（端口 %d），已发送 SHOW=%s，本进程静默退出" % (SINGLE_PORT, ok))
@@ -1296,7 +578,9 @@ def run():
         log("托盘初始化失败，应用退出")
         return 1
 
-    # 窗口子进程（携带贴纸配置；主进程是 widget.json 唯一写者）
+    # 窗口子进程（携带贴纸配置；主进程是 widget.json 唯一写者）。
+    # spawn target 必须是可导入模块中的顶层函数（monitor.winchild.window_process_main），
+    # frozen 形态下子进程按模块路径反序列化，定义在 __main__ 会导致引导卡住。
     cfg = load_widget_cfg()
     apply_widget_cfg(cfg)
     parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
@@ -1313,14 +597,23 @@ def run():
     threading.Thread(target=child_msg_loop, args=(parent_conn,), daemon=True,
                      name="child-msg").start()
     # 初始推送：数据 + 配置（子进程 loaded 事件后由命令循环注入渲染）
-    threading.Thread(
-        target=lambda: (time.sleep(2), child_send(("WIDGET_DATA", widget_stats())),
-                        child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
-                                                   "pinned": TRAY.widget_pinned,
-                                                   "opacity": TRAY.widget_opacity})),
-                        child_send(("WIDGET_PIN", TRAY.widget_pinned))),
-        daemon=True, name="widget-init",
-    ).start()
+    # 初始贴纸数据同样优先 sidecar（启动兜底刷新刚跑完时已存在）
+    def _initial_widget_push():
+        time.sleep(2)
+        sc = load_sidecar()
+        if sc is not None:
+            child_send(("WIDGET_DATA", sc))
+            log("初始贴纸数据已推送（sidecar）")
+        else:
+            child_send(("WIDGET_DATA", widget_stats()))
+            log("初始贴纸数据：sidecar 不可用，回退直查")
+        child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
+                                   "pinned": TRAY.widget_pinned,
+                                   "opacity": TRAY.widget_opacity}))
+        child_send(("WIDGET_PIN", TRAY.widget_pinned))
+
+    threading.Thread(target=_initial_widget_push, daemon=True,
+                     name="widget-init").start()
 
     # 自动刷新 + 子进程监控
     threading.Thread(target=auto_refresh_loop, daemon=True, name="auto-refresh").start()
