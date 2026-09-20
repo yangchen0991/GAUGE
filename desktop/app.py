@@ -23,8 +23,8 @@ pywebview（pythonnet/CLR）环境中会静默失败（实测注册表 NotifyIco
   必须位于可导入模块——frozen 形态下 spawn 按模块路径反序列化 target，
   定义在 __main__ 会让子进程引导卡住）
   · 主面板：AI-Agent监控台.html；关闭窗口 = 隐藏到托盘（closing return False）
-  · 桌面贴纸：widget.html，无边框+透明+置顶，Win11 DWM Acrylic 毛玻璃
-    （DWMWA_SYSTEMBACKDROP_TYPE=38→3，主题事件重设时低频幂等重打），
+  · 桌面贴纸：widget.html，无边框+透明+置顶；玻璃为页面级半透明（--bg rgba），
+    防御性关闭 DWM 背景效果（着色层会无视圆角裁剪画满矩形，见 winchild 说明），
     鼠标穿透（WS_EX_TRANSPARENT 整窗开关）、位置记忆（widget.json，主进程唯一写者）
   · 通过 Pipe 接收主进程命令：SHOW / RELOAD / EXIT / WIDGET_SHOW / WIDGET_HIDE /
     WIDGET_CFG（穿透+透明度）/ WIDGET_DATA（统计数据注入渲染）

@@ -3,8 +3,9 @@
 
 承载两个 webview 窗口的创建与命令服务：
 - 主面板：AI-Agent监控台.html；关闭窗口 = 隐藏到托盘（closing return False）
-- 桌面贴纸：widget.html，无边框+透明+置顶，Win11 DWM Acrylic 毛玻璃
-  （DWMWA_SYSTEMBACKDROP_TYPE=38→3，主题事件重设时低频幂等重打），
+- 桌面贴纸：widget.html，无边框+透明+置顶；玻璃为页面级半透明（--bg rgba），
+  不使用任何 DWM 背景效果——实测 SYSTEMBACKDROP 与经典 blur-behind 的
+  着色层都会无视 SetWindowRgn 画满矩形（2026-09-20 弃用）；
   鼠标穿透（WS_EX_TRANSPARENT 整窗开关）、拖动位置回传主进程记忆
 
 关键约束（批次3a 修复）：window_process_main 是 spawn target，必须定义在
@@ -21,7 +22,7 @@ from typing import Any, Dict, Optional
 import webview
 
 from monitor.appenv import (
-    HTML_PATH, WIDGET_BACKDROP_MIN_BUILD, WIDGET_HTML_PATH,
+    HTML_PATH, WIDGET_HTML_PATH,
     WIDGET_TITLE, WINDOW_TITLE, log, setup_logging,
 )
 from monitor.config import (
@@ -113,37 +114,33 @@ def _win_hwnd(window: Any) -> Optional[int]:
 
 
 def apply_acrylic_backdrop(hwnd: int) -> bool:
-    """Win11 22621+：DWMWA_SYSTEMBACKDROP_TYPE=3（Acrylic）+ 暗色 + sheet-of-glass。
+    """玻璃 = 页面级半透明（--bg rgba）；防御性关闭一切 DWM 背景效果。
 
-    注意：pywebview 会在系统主题变化事件时把 38 号属性重设（dark→2/light→1），
-    因此该函数需要低频幂等重调（数据注入/窗口 shown 时）。
-    返回 True=已设置；False=环境不支持（调用方应加深 CSS 背景降级）。
+    2026-09-20 实测（Win11 24H2 + WebView2 + SetWindowRgn 圆角裁剪）：
+    SYSTEMBACKDROP(38=3) 与经典 DwmEnableBlurBehindWindow 的着色层都会
+    画满整个窗口矩形且无视裁剪区域/BLURREGION——圆角外被恒定平涂染色。
+    完全不启用 DWM 效果时，WebView2 透明链路逐像素透出桌面：角外与桌面
+    逐像素一致，页面玻璃区呈真实半透明。因此此处只做防御性关闭（防止
+    系统主题给窗口挂上背景效果），返回 True 表示"玻璃可用"（由 CSS 呈现）；
+    False 保留给 dwmapi 不可用的极端环境（页面降级实底）。
     """
     try:
-        if sys.getwindowsversion().build < WIDGET_BACKDROP_MIN_BUILD:
-            return False
         import ctypes
+        from ctypes import wintypes as wt
         d = ctypes.windll.dwmapi
         hwnd = int(hwnd)
+        none_backdrop = ctypes.c_int(1)      # DWMSBT_NONE
+        d.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(none_backdrop), 4)
 
-        class MARGINS(ctypes.Structure):
-            _fields_ = [("cxLeftWidth", ctypes.c_int), ("cxRightWidth", ctypes.c_int),
-                        ("cyTopHeight", ctypes.c_int), ("cyBottomHeight", ctypes.c_int)]
-
-        backdrop = ctypes.c_int(3)      # DWMSBT_TRANSIENTWINDOW → Acrylic
-        dark = ctypes.c_int(1)          # DWMWA_USE_IMMERSIVE_DARK_MODE
-        from ctypes import wintypes as wt
-        d.DwmSetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
-        d.DwmSetWindowAttribute.restype = ctypes.c_long
-        d.DwmExtendFrameIntoClientArea.argtypes = [wt.HWND, ctypes.POINTER(MARGINS)]
-        d.DwmExtendFrameIntoClientArea.restype = ctypes.c_long
-        result = d.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop), 4)
-        d.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), 4)
-        margins = MARGINS(-1, -1, -1, -1)   # sheet of glass
-        frame_result = d.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(margins))
-        return result == 0 and frame_result == 0
+        class BLURBEHIND(ctypes.Structure):
+            _fields_ = [("dwFlags", ctypes.c_uint), ("fEnable", ctypes.c_int),
+                        ("hRgnBlur", wt.HRGN),
+                        ("fTransitionOnMaximized", ctypes.c_int)]
+        bb = BLURBEHIND(0x1, 0, None, 0)     # 仅 ENABLE 标志，fEnable=0 → 禁用
+        d.DwmEnableBlurBehindWindow(hwnd, ctypes.byref(bb))
+        return True
     except Exception:
-        _log.exception("[win] 毛玻璃设置失败（降级为深色实底）")
+        _log.exception("[win] 防御性关闭 DWM 背景效果失败（不影响角外透明）")
         return False
 
 
@@ -246,7 +243,7 @@ def _sync_widget_geometry(state: "_WindowState", widget: Any,
             return
         scale = max(1.0, ctypes.windll.user32.GetDpiForWindow(hwnd) / 96.0)
         # The default Control background paints a grey rectangle below a
-        # transparent WebView. Black is the DWM glass backing surface.
+        # transparent WebView shows the desktop through the window surface.
         native.BackColor = Color.Black
         target = Size(round(width * scale), round(height * scale))
         if native.ClientSize != target:

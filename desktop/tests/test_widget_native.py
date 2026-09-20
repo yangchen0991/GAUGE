@@ -110,15 +110,22 @@ def test_rounded_region_matches_css_radius_and_releases_only_on_failure(monkeypa
     gdi.DeleteObject.assert_called_once_with(123)
 
 
-def test_acrylic_failure_is_not_reported_as_supported(monkeypatch):
+def test_glass_uses_no_dwm_effects_and_reports_support(monkeypatch):
     dwm = Mock()
-    dwm.DwmSetWindowAttribute.return_value = -1
-    dwm.DwmExtendFrameIntoClientArea.return_value = 0
     monkeypatch.setattr(ctypes.windll, 'dwmapi', dwm)
-    monkeypatch.setattr(wc.sys, 'getwindowsversion', lambda: Mock(build=22631))
-    assert not wc.apply_acrylic_backdrop(123)
-    dwm.DwmSetWindowAttribute.return_value = 0
     assert wc.apply_acrylic_backdrop(123)
+    # 防御性关闭：SYSTEMBACKDROP 置 NONE（38=1）且禁用 blur-behind；
+    # 值与调用次数都钉死，拦截"误启用 backdrop=3/追加暗色属性"类回归
+    assert dwm.DwmSetWindowAttribute.call_count == 1
+    args = dwm.DwmSetWindowAttribute.call_args_list[0].args
+    assert args[0] == 123 and args[1] == 38 and args[2]._obj.value == 1
+    dwm.DwmEnableBlurBehindWindow.assert_called_once()
+    bb_flags, bb_enable = dwm.DwmEnableBlurBehindWindow.call_args.args[1]._obj.dwFlags, \
+        dwm.DwmEnableBlurBehindWindow.call_args.args[1]._obj.fEnable
+    assert bb_flags & 0x1 and bb_enable == 0
+    # dwmapi 不可用 → 降级信号 False（页面转实底）
+    dwm.DwmSetWindowAttribute.side_effect = OSError
+    assert not wc.apply_acrylic_backdrop(123)
 
 
 def test_round_window_rgn_derives_clip_from_shared_geometry(monkeypatch):
