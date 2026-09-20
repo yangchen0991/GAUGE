@@ -594,9 +594,16 @@ def _sidecar_plan_tier():
     候选路径覆盖两种形态：源码（BASE_DIR/desktop/widget.json，与
     monitor.config 的 WIDGET_CFG_PATH 同源）；冻结（exe）形态 refresh.py 与
     打包资源同目录（_MEIPASS/_internal，即 BASE_DIR/widget.json）。
+
+    冻结形态下 BASE_DIR=_MEIPASS（只读临时区，退出即删），前两个候选必然落空；
+    故追加「成品 HTML 同目录」候选：refreshctl._run_refresh_inline 会在 exec_module
+    之后把 OUTPUT_PATH 覆盖为 APP_DIR/AI-Agent监控台.html，此时 dirname(OUTPUT_PATH)
+    即 exe 目录，正好与 monitor.config 冻结形态写出的 widget.json 同处。
+    源码形态该候选指向仓库根（widget.json 不存在，无害），原有候选与顺序保持不变。
     """
     for cand in (os.path.join(BASE_DIR, "desktop", "widget.json"),
-                 os.path.join(BASE_DIR, "widget.json")):
+                 os.path.join(BASE_DIR, "widget.json"),
+                 os.path.join(os.path.dirname(OUTPUT_PATH), "widget.json")):
         try:
             with open(cand, "r", encoding="utf-8") as f:
                 raw = json.load(f)

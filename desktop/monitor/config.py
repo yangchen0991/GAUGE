@@ -6,10 +6,21 @@
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-WIDGET_CFG_PATH: Path = Path(__file__).resolve().parent.parent / "widget.json"
+# 贴纸配置路径必须在「模块导入时」确定：load_widget_cfg/save_widget_cfg 的默认
+# 参数在此刻绑定到 WIDGET_CFG_PATH，运行时 monkeypatch 无法修正。
+#
+# 源码形态：desktop/widget.json（本文件在 desktop/monitor/ 下，parent.parent=desktop）。
+# 冻结形态：PyInstaller 把 PYZ 内模块的 __file__ 指到 _MEIPASS（临时解包目录，退出即删），
+#   若沿用 __file__ 派生，配置每次重启都会丢失。故冻结时改用 exe 所在目录
+#   （与 monitor.appenv.APP_DIR 同源），保证位置/透明度/档位/显隐持久化。
+if getattr(sys, "frozen", False):
+    WIDGET_CFG_PATH: Path = Path(sys.executable).resolve().parent / "widget.json"
+else:
+    WIDGET_CFG_PATH = Path(__file__).resolve().parent.parent / "widget.json"
 WIDGET_DEFAULT_POS = (1400, 140)
 
 # 贴纸内设置 popover 与托盘菜单共用的合法档位。配置文件历史版本仍可
