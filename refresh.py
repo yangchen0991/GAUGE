@@ -7,7 +7,7 @@ refresh.py — 从本机 ZCode 会话库（只读）抽取统计数据，注入 
 - 内置自检：行扫描与聚合 SQL 两条独立路径核对通过才写成品文件。
 - 失败时不产出损坏 HTML：全部校验通过后才原子替换（保留旧文件）。
 
-main() 只做流程编排；八步主流程各自封装为单一职责函数：
+main() 只做流程编排；九步主流程各自封装为单一职责函数：
   load_template          步骤 1  读取模板并校验数据占位符
   open_db                步骤 2  只读建 WAL 快照连接
   scan_model_usage       步骤 3a 行扫描 model_usage（路径 A）
@@ -17,10 +17,18 @@ main() 只做流程编排；八步主流程各自封装为单一职责函数：
   serialize_and_inject   步骤 6  JSON 回读验证 + 转义注入 + 外链检查
   node_syntax_check      步骤 6b  成品内联 JS 语法校验
   atomic_write           步骤 7  tmp + os.replace 原子写入
+  write_sidecar          步骤 8  原子写桌面 sidecar（AI-Agent监控台.data.json）
 
 DATA 契约（template.html 消费端）：
   meta/agents/providers/models/pricing/pricing_usd/sessions/requests/tools/agg，
   字段语义详见 build_payload 内注释与 desktop/README.md。
+
+sidecar 契约（desktop/app.py 消费端，见 write_sidecar）：
+  generated_at/db_display/today/week/last_error/pricing/plan/window5h/thisweek，
+  与 desktop/monitor/stats.py 的 widget_stats 输出形状一致；
+  plan/window5h/thisweek 为 GAUGE 官方积分窗口口径（2026-09-20 冻结，末尾追加，
+  旧键与顺序不变），与 stats.py 双链共用同一套常数（测试锁一致）；
+  sidecar 写失败仅警告不影响退出码（HTML 是主交付物，桌面侧有 stats 直查回退）。
 """
 import json
 import os
@@ -30,14 +38,13 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(BASE_DIR, "template.html")
 OUTPUT_PATH = os.path.join(BASE_DIR, "AI-Agent监控台.html")
-# 测试钩子：AGENT_MONITOR_DB 环境变量可覆盖数据库路径（默认本机活库）
-DB_PATH = os.environ.get("AGENT_MONITOR_DB") or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
 # 测试钩子：AGENT_MONITOR_DB 环境变量可覆盖数据库路径（默认本机活库）
 DB_PATH = os.environ.get("AGENT_MONITOR_DB") or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
 DB_DISPLAY = DB_PATH + "（只读导出）"
@@ -85,6 +92,24 @@ PRICING_USD = {
          "input": 0.15, "output": 0.50, "cache_read": 0.03, "cache_write": 0},
     ],
 }
+
+# ---------- GAUGE 官方积分口径（2026-09-20 检索冻结；与 desktop/monitor/stats.py
+# 双链共用同一套常数，一致性由 desktop/tests/test_stats.py 的双链漂移锁测试守护） ----------
+# 积分系数（积分/百万 token）：model_id -> (输入, 缓存读取, 输出)；未列出模型按 0 计。
+CREDIT_COEFFS = {
+    "GLM-5.3": (6.9, 1.7, 24.0),
+    "GLM-5.3-Flash": (2.3, 0.56, 8.0),
+}
+# 积分换算除数：系数语义=积分/百万 token；官方文档字面为 /10000，与官方 V2→V3
+# 迁移等价关系及实测数据矛盾，工程判定取 /1e6（2026-09-20 研究判定，非官方确认）。
+CREDIT_DIVISOR = 1_000_000
+# 套餐档位额度（积分）：tier -> (5h 窗口额度, 周额度)；默认 lite。
+PLAN_QUOTAS = {
+    "lite": (2000, 10000),
+    "pro": (12000, 60000),
+    "max": (28000, 140000),
+}
+DEFAULT_PLAN_TIER = "lite"
 
 
 def die(msg):
@@ -201,15 +226,17 @@ def load_template():
 
 
 # ---------- 步骤 3a：model_usage 行扫描（自检路径 A 的一半） ----------
-def scan_model_usage(conn, sess_idx, n_sess):
+def scan_model_usage(conn, sess_idx, n_sess, orphan_idx=None):
     """全量行扫描 model_usage，聚合出会话/Agent/Provider/模型四类统计。
 
+    orphan_idx：「未知会话」合成行在 sess_rows 中的下标（无孤儿时为 None）；
+    孤儿行（session_id 不在 session 表）计入该下标的会话累计并进入请求明细。
     返回 dict：
       agg        全局计数器（req/i/o/cr/st 三态）
       req_raw    请求明细行列表（供 build_payload 生成 DATA.requests）
       s_acc      按会话累计 {r,i,o,cr,ok,err,canc,retry}
       s_ag/s_md  按会话出现过的 agent/model 名集合
-      orphans    session_id 不在 session 表中的孤儿行数
+      orphans    session_id 不在 session 表中的孤儿行数（已归入合成行）
       min_t/max_t 请求时间范围（毫秒 epoch；全空为 None）
       err_types  error_type 非空计数（供 agg.err_types）
     """
@@ -250,7 +277,11 @@ def scan_model_usage(conn, sess_idx, n_sess):
         si = sess_idx.get(sid)
         if si is None:
             orphans += 1
-            continue
+            si = orphan_idx
+            if si is None:
+                # 防御路径：调用方未提供合成行下标（快照不一致）时保留旧行为——
+                # 跳过明细与按会话累计；该不一致由 selfcheck 的明细对账兜底拦截
+                continue
         acc = s_acc[si]
         acc["r"] += 1
         acc["i"] += i or 0
@@ -316,8 +347,9 @@ def selfcheck(conn, scan_mu, tools_total, n_sess, n_sessions_sql):
     """行扫描（路径 A）与聚合 SQL（路径 B）逐项核对。
 
     核对项：请求数/三类 token 总和/status 三态/tool_usage 总数/session 总数
-    （n_sess=行数、n_sessions_sql=SQL COUNT，两条独立采集路径交叉）。
-    任一不一致 die（数据库可能被并发修改，放弃写入）；孤儿行仅警告。
+    （n_sess=排除合成行后的行数、n_sessions_sql=SQL COUNT，两条独立采集路径交叉）；
+    另核对请求明细条数与总计同源（req_raw 数 == agg.req）。
+    任一不一致 die（数据库可能被并发修改，放弃写入）；孤儿行归入「未知会话」合成行。
     """
     q = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
     b_mu = q("SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
@@ -348,8 +380,12 @@ def selfcheck(conn, scan_mu, tools_total, n_sess, n_sessions_sql):
             ok = False
     if not ok:
         die("自检未通过：两条 SQL 路径统计不一致（数据库可能在读取中被并发修改），已放弃写入，旧文件保留。")
+    # 明细对账：请求明细必须与总计同源，否则页面"总计含孤儿、明细不含"的口径分裂会复发
+    if len(scan_mu["req_raw"]) != scan_mu["agg"]["req"]:
+        die("自检未通过：请求明细与总计口径不一致（明细 %d 条 ≠ 总计 %d 条），已放弃写入，旧文件保留。"
+            % (len(scan_mu["req_raw"]), scan_mu["agg"]["req"]))
     if scan_mu["orphans"]:
-        print("  [警告] %d 条 model_usage 记录的 session_id 在 session 表中不存在（孤儿行），已从请求明细中剔除。"
+        print("  [警告] %d 条 model_usage 记录的 session_id 在 session 表中不存在（孤儿行），已归入「未知会话」合成行。"
               % scan_mu["orphans"])
 
 
@@ -358,10 +394,15 @@ def build_payload(scan_mu, scan_tu, sess_rows):
     """把扫描结果组装为 template.html 消费端约定的 DATA 字典。
 
     前置条件：sess_rows 已由 main 按 (time_created, id) 排序（排序在扫描前完成，
-    保证 s_acc 累加器下标与本函数 enumerate 下标一致）；requests 按开始时间升序。
+    保证 s_acc 累加器下标与本函数 enumerate 下标一致）；「未知会话」合成行（若有）
+    固定追加在末尾、不参与排序，不破坏该不变量。requests 按开始时间升序。
     st/fin 映射与错误类型仅随 status='error' 行携带。
     """
     sess_idx = {r[0]: i for i, r in enumerate(sess_rows)}
+    # 「未知会话」合成行下标（id=""，仅存在孤儿请求时由 main 追加；空 id 会话已被
+    # main 防御 die 排除，故该键存在当且仅当追加了合成行）。孤儿请求的 session_id
+    # 指向不存在的会话，映射时统一落到合成行。
+    synthetic_idx = sess_idx.get("")
 
     agent_order = sorted(scan_mu["agent_cnt"].keys(), key=lambda k: (-scan_mu["agent_cnt"][k], k))
     agent_idx = {k: i for i, k in enumerate(agent_order)}
@@ -380,6 +421,7 @@ def build_payload(scan_mu, scan_tu, sess_rows):
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "db_path": DB_DISPLAY,
             "range": [scan_mu["min_t"], scan_mu["max_t"]],
+            "orphans": scan_mu["orphans"],
             "counts": {
                 "sessions": len(sess_rows),
                 "requests": agg["req"],
@@ -401,12 +443,18 @@ def build_payload(scan_mu, scan_tu, sess_rows):
 
 
 def _build_requests(req_raw, sess_idx, agent_idx, prov_idx, model_idx):
-    """生成 DATA.requests：每行一条请求记录，按开始时间升序（t 为 None 的排尾部）。"""
+    """生成 DATA.requests：每行一条请求记录，按开始时间升序（t 为 None 的排尾部）。
+
+    孤儿请求的 session_id 不在 sess_idx 中，统一映射到「未知会话」合成行下标
+    （synthetic_idx）；无合成行时不存在此类行（selfcheck 明细对账兜底拦截）。
+    """
+    synthetic_idx = sess_idx.get("")
     requests_out = []
     for (sid, pk, mk, ak, status, t, d, tt, fin, cbu, et, i, o, cr) in req_raw:
         st = st_of(status, cbu)
         rec = {
-            "t": t, "s": sess_idx[sid], "m": model_idx[mk], "p": prov_idx[pk], "a": agent_idx[ak],
+            "t": t, "s": sess_idx.get(sid, synthetic_idx),
+            "m": model_idx[mk], "p": prov_idx[pk], "a": agent_idx[ak],
             "i": i or 0, "o": o or 0, "cr": cr or 0,
         }
         if d is not None:
@@ -500,10 +548,211 @@ def atomic_write(out):
         die("写入成品文件失败：%s" % e)
 
 
+# ---------- 步骤 8：桌面 sidecar（单一统计链） ----------
+def _sidecar_price_map():
+    """PRICING_CNY.rows → {model_id: {"input": f, "cache_read": f, "output": f}}。
+
+    与 template.html 从 DATA.pricing.rows 构建 PRICES 的形状一致（网页默认价目）。
+    """
+    return {r["model"]: {"input": r["input"], "cache_read": r["cache_read"],
+                         "output": r["output"]} for r in PRICING_CNY["rows"]}
+
+
+def _row_cost(model_id, i, o, cr, prices):
+    """单请求成本（元），与 template.html costOf 同公式：
+    非缓存输入×输入价 + 缓存读取×缓存读取价 + 输出×输出价；
+    缓存读取超出输入按输入钳制（防御脏数据）；未配价模型按 0 计。
+    """
+    p = prices.get(model_id)
+    if not p:
+        return 0.0
+    cr = min(cr, i)
+    return ((i - cr) * p["input"] + cr * p["cache_read"] + o * p["output"]) / 1000000.0
+
+
+def _peak_factor(ts_ms):
+    """峰谷系数：周一至周五本地 14:00–18:00（含 14:00、不含 18:00）×1.0，其余 ×0.5。
+
+    官方高峰定义为 UTC+8；本产品假设本机时区=UTC+8。与 stats.peak_factor 同构。
+    """
+    local = datetime.fromtimestamp(ts_ms / 1000.0)
+    if local.weekday() >= 5:          # weekday(): 周一=0 … 周六=5、周日=6
+        return 0.5
+    return 1.0 if 14 <= local.hour < 18 else 0.5
+
+
+def _row_credits(model_id, i, o, cr, ts_ms):
+    """单请求积分（官方口径逐行计；与 _row_cost 不同，不做 cache_read 钳制；
+    未列出模型按 0 计）。与 stats.credits_of 同构。"""
+    ci, cc, co = CREDIT_COEFFS.get(model_id, (0.0, 0.0, 0.0))
+    return (i * ci + cr * cc + o * co) / CREDIT_DIVISOR * _peak_factor(ts_ms)
+
+
+def _sidecar_plan_tier():
+    """从贴纸配置 widget.json 读取档位；缺失/损坏/非法一律回退 "lite"。
+
+    候选路径覆盖两种形态：源码（BASE_DIR/desktop/widget.json，与
+    monitor.config 的 WIDGET_CFG_PATH 同源）；冻结（exe）形态 refresh.py 与
+    打包资源同目录（_MEIPASS/_internal，即 BASE_DIR/widget.json）。
+    """
+    for cand in (os.path.join(BASE_DIR, "desktop", "widget.json"),
+                 os.path.join(BASE_DIR, "widget.json")):
+        try:
+            with open(cand, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict):
+            t = raw.get("plan_tier")
+            if isinstance(t, str) and t in PLAN_QUOTAS:
+                return t
+    return DEFAULT_PLAN_TIER
+
+
+def write_sidecar(scan_mu, meta_generated_at):
+    """从已聚合数据计算桌面所需紧凑包并原子写 sidecar JSON（步骤 8）。
+
+    不再查库：全部数据来自 scan_mu["req_raw"] 行扫描结果，与成品 HTML 同一
+    WAL 快照、同一口径，保证桌面统计链与网页完全一致。
+
+    路径派生不变量：sidecar 与成品 HTML 永远同目录同名主干——运行时从
+    OUTPUT_PATH 派生（OUTPUT_PATH 以 .html 结尾，取 [:-5] 替换扩展名）；
+    exe 内联形态 desktop/monitor/refreshctl.py 会把 OUTPUT_PATH 覆盖为 exe 目录，派生自动跟随，
+    故不设模块级 sidecar 常量（避免 _MEIPASS 只读临时区错位）。
+
+    内容契约（desktop/app.py load_sidecar / widget.html renderWidget 消费）：
+      generated_at  与 DATA.meta.generated_at 同一值（由 main 传入）
+      db_display    数据库展示路径
+      today         本地今日零点起：requests 计数 + in/out/cr 累计 + 按管线价目成本
+      week          近 7 天（含今日）每日 {d,full,req,cost}，恰 7 项、今日为最后一项
+      last_error    最近 24h 内最新一条错误行（st==1 且 error_type 非空，
+                    与 _build_requests 的 et 携带口径及 stats.py 回退口径一致），
+                    {"type", "at"(HH:MM)}；无则 null
+      pricing       管线价目快照（同 DATA.pricing.rows 的模型集合）
+      plan          GAUGE 档位 {"tier", "window5h_limit", "week_limit"}（widget.json
+                    读取，缺失/损坏/非法回退 lite）
+      window5h      {"credits", "used_pct", "reset_eta_min"}：started_at >= now-5h
+                    的积分和（官方公式逐行计×峰谷系数）、占额度百分比（1 位小数，
+                    可 >100）、窗口内最早请求 + 5h 距现在的分钟数（四舍五入取整，
+                    窗口为空 null）
+      thisweek      {"credits", "used_pct"}：本自然周（周一 00:00 本地起）积分和
+                    与占周额度百分比
+
+    写失败仅打印警告、不影响退出码：HTML 是主交付物，桌面侧对 sidecar 缺失
+    有 stats 直查回退。返回 True=成功。
+    """
+    sidecar_path = OUTPUT_PATH[:-5] + ".data.json"
+    today0 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight_ms = int(today0.timestamp() * 1000)          # 本地今日零点（epoch 毫秒）
+    week0_ms = midnight_ms - 6 * 86400 * 1000             # 近 7 天（含今日）起点
+    err_since_ms = int((time.time() - 86400) * 1000)      # 最近 24h（与 stats.py 同构）
+    prices = _sidecar_price_map()
+
+    # GAUGE 积分窗口（官方口径）：5h 窗口 + 本自然周（周一 00:00 本地起）
+    tier = _sidecar_plan_tier()
+    w5h_limit, week_limit = PLAN_QUOTAS[tier]
+    now_ms = int(time.time() * 1000)
+    win5_start_ms = now_ms - 5 * 3600 * 1000              # now-5h
+    monday0 = today0 - timedelta(days=today0.weekday())   # 本自然周周一 00:00（本地）
+    week_start_ms = int(monday0.timestamp() * 1000)
+    win5_credits = 0.0
+    week_credits = 0.0
+    earliest5 = None
+
+    # today/week/last_error/积分窗口一次遍历 req_raw 聚合完成（禁止再查库）
+    n_req, t_in, t_out, t_cr = 0, 0, 0, 0
+    today_cost = 0.0
+    week = [{"req": 0, "cost": 0.0} for _ in range(7)]    # 下标 0=最旧 … 6=今日
+    last_error = None
+    err_best_t = None
+    for (_sid, _pk, mk, _ak, status, t, _d, _tt, _fin, cbu, et, i, o, cr) in scan_mu["req_raw"]:
+        if t is None:
+            continue                                      # 无时间行不计入时间窗（同 SQL NULL 语义）
+        i, o, cr = i or 0, o or 0, cr or 0
+        cost = _row_cost(mk, i, o, cr, prices)
+        credits = _row_credits(mk, i, o, cr, t)
+        if t >= week_start_ms:
+            week_credits += credits
+        if t >= win5_start_ms:
+            win5_credits += credits
+            if earliest5 is None or t < earliest5:
+                earliest5 = t
+        if t >= midnight_ms:
+            n_req += 1
+            t_in += i
+            t_out += o
+            t_cr += cr
+            today_cost += cost
+        if t >= week0_ms:
+            # 按本地日历日分桶：与 stats.py 的 date(...,'localtime') 及 "%Y-%m-%d" 键一致；
+            # 未来时间戳（异常数据）idx 为负，防御性跳过
+            idx = 6 - (today0.date() - datetime.fromtimestamp(t / 1000).date()).days
+            if 0 <= idx < 7:
+                week[idx]["req"] += 1
+                week[idx]["cost"] += cost
+        if t >= err_since_ms and st_of(status, cbu) == 1 \
+                and et is not None and str(et).strip() != "":
+            if err_best_t is None or t > err_best_t:
+                err_best_t = t
+                last_error = {"type": clean(et),
+                              "at": datetime.fromtimestamp(t / 1000).strftime("%H:%M")}
+
+    week_out = []
+    for off in range(6, -1, -1):
+        d0 = today0 - timedelta(days=off)
+        e = week[6 - off]
+        week_out.append({
+            "d": d0.strftime("%m-%d"),
+            "full": d0.strftime("%Y-%m-%d"),
+            "req": e["req"],
+            "cost": round(e["cost"], 2),
+        })
+
+    # 5h 窗口重置倒计时：窗口内最早请求 + 5h 距现在的分钟数；四舍五入取整
+    # （半进位，整数毫秒运算避免浮点边界）；窗口为空 → None。窗口成员保证
+    # earliest5 >= win5_start_ms，故 diff_ms >= 0。
+    reset_eta_min = None
+    if earliest5 is not None:
+        diff_ms = earliest5 + 5 * 3600 * 1000 - now_ms
+        reset_eta_min = (diff_ms + 30_000) // 60_000
+
+    data = {
+        "generated_at": meta_generated_at,
+        "db_display": DB_DISPLAY,
+        "today": {"requests": n_req, "cost": round(today_cost, 2),
+                  "in": t_in, "out": t_out, "cr": t_cr},
+        "week": week_out,
+        "last_error": last_error,
+        "pricing": prices,
+        "plan": {"tier": tier, "window5h_limit": w5h_limit, "week_limit": week_limit},
+        "window5h": {"credits": round(win5_credits, 1),
+                     "used_pct": round(win5_credits / w5h_limit * 100, 1),
+                     "reset_eta_min": reset_eta_min},
+        "thisweek": {"credits": round(week_credits, 1),
+                     "used_pct": round(week_credits / week_limit * 100, 1)},
+    }
+    tmp = sidecar_path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, sidecar_path)                     # tmp + os.replace，与 atomic_write 同语义
+    except Exception as e:  # noqa: BLE001
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        print("[警告] sidecar 写入失败（桌面侧将回退 stats 直查，不影响成品 HTML）：%s: %s"
+              % (type(e).__name__, e), file=sys.stderr)
+        return False
+    print("桌面 sidecar：%s" % sidecar_path)
+    return True
+
+
 def main():
-    """数据管线编排：八步顺序执行，任一步失败 die（旧成品保留）。
+    """数据管线编排：九步顺序执行，任一步失败 die（旧成品保留）。
 
     返回退出码：0 成功。会话总数经 (行数, SQL COUNT) 双路径采集后传入自检。
+    步骤 8（sidecar）例外：写失败仅警告，不影响退出码（桌面侧有回退）。
     """
     print("=== AI Agent 监控台 数据刷新 ===")
     print("数据库（只读）：" + DB_PATH)
@@ -521,16 +770,34 @@ def main():
         # （不变量：若在 build_payload 内才排序，DB 返回序≠排序序时统计会错位）
         sess_rows = q("SELECT id, title, directory, time_created, time_updated FROM session")
         sess_rows.sort(key=lambda r: ((r[3] if r[3] is not None else 0), r[0] or ""))
+        # 孤儿请求（session_id 不在 session 表的 model_usage 行）：旧实现只计入全局
+        # 总计、不进请求明细，页面"总计含孤儿、明细不含"。统一口径：存在孤儿时在
+        # 排序结果末尾追加「未知会话」合成行——合成行固定追加在末尾、不参与排序，
+        # 维持「排序先于 sess_idx/行扫描」不变量。
+        has_orphan = q("SELECT 1 FROM model_usage WHERE session_id NOT IN "
+                       "(SELECT id FROM session) LIMIT 1")
+        if has_orphan:
+            # 防御：正常库不可能出现空 id 会话；若存在，合成行 id="" 会与其在
+            # sess_idx 中冲突，无法安全统一口径，放弃写入
+            if q("SELECT 1 FROM session WHERE id='' LIMIT 1"):
+                die("session 表存在 id 为空字符串的记录，与「未知会话」合成行 id 冲突，"
+                    "无法统一孤儿请求口径。")
+            sess_rows.append(("", "（未知会话）", "", None, None))
+            orphan_idx = len(sess_rows) - 1
+        else:
+            orphan_idx = None
         n_sess = len(sess_rows)
         n_sessions_sql = q("SELECT COUNT(*) FROM session")[0][0]
 
         # ---- 3a/3b. 行扫描（路径 A；此时 sess_rows 已排序，下标与最终输出一致）----
         sess_idx = {r[0]: i for i, r in enumerate(sess_rows)}
-        scan_mu = scan_model_usage(conn, sess_idx, n_sess)
+        scan_mu = scan_model_usage(conn, sess_idx, n_sess, orphan_idx)
         scan_tu = scan_tool_usage(conn, sess_idx, n_sess)
 
         # ---- 4. 自检（路径 B 核对）----
-        selfcheck(conn, scan_mu, scan_tu["total"], n_sess, n_sessions_sql)
+        # 会话行数对账用「排除合成行后的行数」与 SQL COUNT 比较（合成行非库内记录）
+        n_sess_real = len(sess_rows) - (1 if orphan_idx is not None else 0)
+        selfcheck(conn, scan_mu, scan_tu["total"], n_sess_real, n_sessions_sql)
 
         # ---- 5. 组装 DATA ----
         payload = build_payload(scan_mu, scan_tu, sess_rows)
@@ -543,6 +810,10 @@ def main():
 
         # ---- 7. 原子写入 ----
         atomic_write(out)
+
+        # ---- 8. 桌面 sidecar（单一统计链；失败仅警告，不影响退出码）----
+        # generated_at 与 DATA.meta 同源同值，保证网页与桌面显示同一刷新时刻
+        write_sidecar(scan_mu, payload["meta"]["generated_at"])
     finally:
         try:
             conn.execute("COMMIT")
