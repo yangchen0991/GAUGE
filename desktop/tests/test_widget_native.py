@@ -137,3 +137,93 @@ def test_round_window_rgn_derives_clip_from_shared_geometry(monkeypatch):
     gdi.DeleteObject.assert_not_called()
     wc._round_window_rgn(456, 570, 690, 1.5)
     gdi.CreateRoundRectRgn.assert_called_with(0, 0, 571, 691, 84, 84)
+
+
+def test_move_widget_by_shifts_window_via_setwindowpos(monkeypatch):
+    """页面增量即屏幕物理像素（150% 屏实测，不做 DPI 换算）：
+    GetWindowRect=(100,200,670,890) + dx=100/dy=-50 →
+    SetWindowPos(hwnd,None,200,150,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)。"""
+    state = wc._WindowState()
+    state.widget = Mock()
+    state.widget_native_hwnd = None
+    ui = Mock(side_effect=lambda _widget, callback: callback(None))
+    monkeypatch.setattr(wc, '_on_widget_ui', ui)
+    monkeypatch.setattr(wc, '_win_hwnd', lambda _widget: 456)
+    user = Mock()
+
+    def rect(_hwnd, ptr):
+        ptr._obj.left, ptr._obj.top, ptr._obj.right, ptr._obj.bottom = 100, 200, 670, 890
+        return 1
+
+    user.GetWindowRect.side_effect = rect
+    user.GetParent.return_value = 0          # 未钉桌面：直接屏幕坐标
+    user.SetWindowPos.return_value = 1
+    monkeypatch.setattr(ctypes.windll, 'user32', user)
+
+    assert wc.WidgetApi(state).move_widget_by(100, -50)
+    user.SetWindowPos.assert_called_once_with(456, None, 200, 150, 0, 0, 0x15)
+    user.GetParent.assert_called_once_with(456)
+
+
+def test_move_widget_by_maps_into_parent_when_pinned(monkeypatch):
+    """钉桌面（WorkerW 子窗口）形态：GetParent 非零时经 MapWindowPoints
+    转父窗口客户区坐标后再 SetWindowPos，不与屏幕坐标系混用。"""
+    state = wc._WindowState()
+    state.widget = Mock()
+    state.widget_native_hwnd = None
+    ui = Mock(side_effect=lambda _widget, callback: callback(None))
+    monkeypatch.setattr(wc, '_on_widget_ui', ui)
+    monkeypatch.setattr(wc, '_win_hwnd', lambda _widget: 456)
+    user = Mock()
+
+    def rect(_hwnd, ptr):
+        ptr._obj.left, ptr._obj.top, ptr._obj.right, ptr._obj.bottom = 100, 200, 670, 890
+        return 1
+
+    user.GetWindowRect.side_effect = rect
+
+    def map_points(_from, _to, ptr, _count):
+        ptr._obj.x += 10
+        ptr._obj.y += 20
+        return 1
+
+    user.GetParent.return_value = 777
+    user.MapWindowPoints.side_effect = map_points
+    user.SetWindowPos.return_value = 1
+    monkeypatch.setattr(ctypes.windll, 'user32', user)
+
+    assert wc.WidgetApi(state).move_widget_by(100, -50)
+    user.MapWindowPoints.assert_called_once()
+    user.SetWindowPos.assert_called_once_with(456, None, 210, 170, 0, 0, 0x15)
+
+
+def test_move_widget_by_rejects_spikes_bad_input_and_missing_hwnd(monkeypatch):
+    state = wc._WindowState()
+    state.widget = Mock()
+    state.widget_native_hwnd = None
+    ui = Mock()
+    monkeypatch.setattr(wc, '_on_widget_ui', ui)
+    monkeypatch.setattr(wc, '_win_hwnd', lambda _widget: None)
+    assert not wc.WidgetApi(state).move_widget_by(301, 0)
+    assert not wc.WidgetApi(state).move_widget_by(0, -301)
+    assert not wc.WidgetApi(state).move_widget_by('abc', 1)
+    assert not wc.WidgetApi(state).move_widget_by(None, 1)
+    assert not wc.WidgetApi(state).move_widget_by(1, 1)   # 数值合法但无 hwnd
+    ui.assert_not_called()
+
+
+def test_move_widget_by_getwindowrect_failure_is_reported(monkeypatch):
+    """hwnd 校验后失效（拖动中窗口被关闭）：GetWindowRect 失败须上抛，
+    外层记日志并返回 False，不得上报成功且不落 SetWindowPos。"""
+    state = wc._WindowState()
+    state.widget = Mock()
+    state.widget_native_hwnd = None
+    ui = Mock(side_effect=lambda _widget, callback: callback(None))
+    monkeypatch.setattr(wc, '_on_widget_ui', ui)
+    monkeypatch.setattr(wc, '_win_hwnd', lambda _widget: 456)
+    user = Mock()
+    user.GetWindowRect.return_value = 0
+    monkeypatch.setattr(ctypes.windll, 'user32', user)
+
+    assert not wc.WidgetApi(state).move_widget_by(100, 50)
+    user.SetWindowPos.assert_not_called()

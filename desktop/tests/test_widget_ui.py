@@ -34,7 +34,7 @@ def test_public_bridge_contract_is_present() -> None:
         "update_widget_settings",
         "refresh_now",
         "hide_widget",
-        "start_drag",
+        "move_widget_by",
     ):
         assert "callApi('" + method + "'" in source
 
@@ -64,3 +64,16 @@ def test_missing_stale_failure_and_svg_tooltip_semantics_are_present() -> None:
     assert 'aria-hidden="true" hidden' in source
     assert "event.key==='Escape'" in source
     assert "focusables[0].focus()" in source
+
+
+def test_usage_unit_toggle_contract_is_present() -> None:
+    """用量卡 积分/Token 双模式（默认积分，页面局部状态不落盘）。"""
+    source = widget_text()
+    assert "用量单位" in source
+    assert 'id="seg-unit"' in source
+    assert 'data-unit="tokens"' in source
+    assert "wx-tokens" in source
+    assert "body.wx-tokens .bar{visibility:hidden}" in source
+    assert "fmtTokens" in source
+    assert "setUsageUnit" in source
+    assert "_lastWidgetData" in source

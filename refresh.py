@@ -631,12 +631,13 @@ def write_sidecar(scan_mu, meta_generated_at):
       pricing       管线价目快照（同 DATA.pricing.rows 的模型集合）
       plan          GAUGE 档位 {"tier", "window5h_limit", "week_limit"}（widget.json
                     读取，缺失/损坏/非法回退 lite）
-      window5h      {"credits", "used_pct", "reset_eta_min"}：started_at >= now-5h
-                    的积分和（官方公式逐行计×峰谷系数）、占额度百分比（1 位小数，
-                    可 >100）、窗口内最早请求 + 5h 距现在的分钟数（四舍五入取整，
-                    窗口为空 null）
-      thisweek      {"credits", "used_pct"}：本自然周（周一 00:00 本地起）积分和
-                    与占周额度百分比
+      window5h      {"credits", "used_pct", "reset_eta_min", "tokens"}：
+                    started_at >= now-5h 的积分和（官方公式逐行计×峰谷系数）、
+                    占额度百分比（1 位小数，可 >100）、窗口内最早请求 + 5h 距现在
+                    的分钟数（四舍五入取整，窗口为空 null）、窗口内原始 token
+                    累计 {"in","cr","out"}（缓存读取=cr；贴纸 Token 模式消费）
+      thisweek      {"credits", "used_pct", "tokens"}：本自然周（周一 00:00 本地起）
+                    积分和、占周额度百分比与窗口内原始 token 累计（同 window5h 键）
 
     写失败仅打印警告、不影响退出码：HTML 是主交付物，桌面侧对 sidecar 缺失
     有 stats 直查回退。返回 True=成功。
@@ -657,6 +658,8 @@ def write_sidecar(scan_mu, meta_generated_at):
     week_start_ms = int(monday0.timestamp() * 1000)
     win5_credits = 0.0
     week_credits = 0.0
+    win5_tin = win5_tcr = win5_tout = 0
+    week_tin = week_tcr = week_tout = 0
     earliest5 = None
 
     # today/week/last_error/积分窗口一次遍历 req_raw 聚合完成（禁止再查库）
@@ -673,8 +676,14 @@ def write_sidecar(scan_mu, meta_generated_at):
         credits = _row_credits(mk, i, o, cr, t)
         if t >= week_start_ms:
             week_credits += credits
+            week_tin += i
+            week_tcr += cr
+            week_tout += o
         if t >= win5_start_ms:
             win5_credits += credits
+            win5_tin += i
+            win5_tcr += cr
+            win5_tout += o
             if earliest5 is None or t < earliest5:
                 earliest5 = t
         if t >= midnight_ms:
@@ -727,9 +736,11 @@ def write_sidecar(scan_mu, meta_generated_at):
         "plan": {"tier": tier, "window5h_limit": w5h_limit, "week_limit": week_limit},
         "window5h": {"credits": round(win5_credits, 1),
                      "used_pct": round(win5_credits / w5h_limit * 100, 1),
-                     "reset_eta_min": reset_eta_min},
+                     "reset_eta_min": reset_eta_min,
+                     "tokens": {"in": win5_tin, "cr": win5_tcr, "out": win5_tout}},
         "thisweek": {"credits": round(week_credits, 1),
-                     "used_pct": round(week_credits / week_limit * 100, 1)},
+                     "used_pct": round(week_credits / week_limit * 100, 1),
+                     "tokens": {"in": week_tin, "cr": week_tcr, "out": week_tout}},
     }
     tmp = sidecar_path + ".tmp"
     try:

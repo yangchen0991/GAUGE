@@ -132,7 +132,8 @@ def widget_stats() -> Dict[str, Any]:
     全部只读；失败返回 {"error": "..."}（贴纸侧显示占位）。
     返回末尾追加 plan/window5h/thisweek（官方积分口径，与 refresh.py sidecar
     同契约）：credits/used_pct 保留 1 位小数，used_pct 可 >100（前端钳制显示），
-    reset_eta_min 为 int 或 null（窗口为空）。
+    reset_eta_min 为 int 或 null（窗口为空）；window5h/thisweek 各含 tokens
+    {"in","cr","out"}（窗口内原始 token 累计，键与 refresh 侧完全一致）。
     """
     try:
         t = today_stats()
@@ -201,13 +202,22 @@ def widget_stats() -> Dict[str, Any]:
         # ---- GAUGE 积分窗口聚合（逐行计，peak 系数按行判定）----
         win5_credits = 0.0
         week_credits = 0.0
+        win5_tin = win5_tcr = win5_tout = 0
+        week_tin = week_tcr = week_tout = 0
         earliest5: Optional[int] = None
         for mid, ts, it, ot, cr in plan_rows:
-            c = credits_of(mid, it or 0, ot or 0, cr or 0, ts)
+            it, ot, cr = it or 0, ot or 0, cr or 0
+            c = credits_of(mid, it, ot, cr, ts)
             if ts >= week_start_ms:
                 week_credits += c
+                week_tin += it
+                week_tcr += cr
+                week_tout += ot
             if ts >= win5_start_ms:
                 win5_credits += c
+                win5_tin += it
+                win5_tcr += cr
+                win5_tout += ot
                 if earliest5 is None or ts < earliest5:
                     earliest5 = ts
         reset_eta_min: Optional[int] = None
@@ -223,9 +233,11 @@ def widget_stats() -> Dict[str, Any]:
             "plan": {"tier": tier, "window5h_limit": w5h_limit, "week_limit": week_limit},
             "window5h": {"credits": round(win5_credits, 1),
                          "used_pct": round(win5_credits / w5h_limit * 100, 1),
-                         "reset_eta_min": reset_eta_min},
+                         "reset_eta_min": reset_eta_min,
+                         "tokens": {"in": win5_tin, "cr": win5_tcr, "out": win5_tout}},
             "thisweek": {"credits": round(week_credits, 1),
-                         "used_pct": round(week_credits / week_limit * 100, 1)},
+                         "used_pct": round(week_credits / week_limit * 100, 1),
+                         "tokens": {"in": week_tin, "cr": week_tcr, "out": week_tout}},
         }
     except Exception as e:  # noqa: BLE001
         return {"error": "%s: %s" % (type(e).__name__, e)}

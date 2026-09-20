@@ -406,19 +406,43 @@ class WidgetApi:
             _log.exception("[win] hide_widget 失败")
             return False
 
-    def start_drag(self) -> bool:
-        """经典无边框窗口拖动：WM_NCLBUTTONDOWN+HTCAPTION 交给 Windows 原生
-        拖动循环（在 js_api 调用线程内模态阻塞，直到用户松开鼠标）。"""
+    def move_widget_by(self, dx: float, dy: float) -> bool:
+        """页面拖动增量（物理像素）：屏幕坐标系 GetWindowRect+SetWindowPos 平移。
+
+        WebView2 mousemove 的 screenX 增量实测即屏幕物理尺度，不再做 DPI 换算；
+        钉桌面（WorkerW 子窗口）时经 MapWindowPoints 转父窗口客户区坐标，
+        两种挂载形态下均严格 1:1 跟手。|dx|/|dy|>300 视为异常尖峰拒绝。
+        """
+        widget = self._state.widget
+        if not isinstance(dx, (int, float)) or not isinstance(dy, (int, float)):
+            return False
+        if abs(dx) > 300 or abs(dy) > 300:
+            return False
+        hwnd = self._state.widget_native_hwnd or _win_hwnd(widget)
+        if not widget or not hwnd:
+            return False
+        import ctypes
+        from ctypes import wintypes as wt
+        user32 = ctypes.windll.user32
+
+        def mv(_native: Any) -> None:
+            r = wt.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                raise OSError("GetWindowRect failed")   # hwnd 校验后失效：交外层记日志并返 False
+            x = r.left + round(dx)
+            y = r.top + round(dy)
+            parent = user32.GetParent(hwnd)
+            if parent:
+                pt = wt.POINT(x, y)
+                user32.MapWindowPoints(None, parent, ctypes.byref(pt), 1)
+                x, y = pt.x, pt.y
+            # SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE
+            user32.SetWindowPos(hwnd, None, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
         try:
-            hwnd = self._state.widget_native_hwnd or _win_hwnd(self._state.widget)
-            if not hwnd:
-                return False
-            import ctypes
-            WM_NCLBUTTONDOWN, HTCAPTION = 0xA1, 2
-            ctypes.windll.user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+            _on_widget_ui(widget, mv)
             return True
         except Exception:
-            _log.exception("[win] start_drag 失败")
+            _log.exception("[win] move_widget_by 失败")
             return False
 
 

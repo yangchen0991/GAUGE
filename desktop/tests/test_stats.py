@@ -292,9 +292,14 @@ class TestWidgetCreditWindows:
         assert w["window5h"]["credits"] == 400.7
         assert w["window5h"]["used_pct"] == 3.3          # 400.7/12000×100=3.339…
         assert w["window5h"]["reset_eta_min"] == 120     # 最早周三 01:00 +5h − 周三 04:00
+        # 窗口内原始 token 累计（与 refresh sidecar 同键）
+        assert w["window5h"]["tokens"] == {"in": 150_000_000, "cr": 90_000_000,
+                                           "out": 14_000_000}
         # 本自然周（周一 00:00 起）额外含周一 GLM 行 220.5
         assert w["thisweek"]["credits"] == 621.2
         assert w["thisweek"]["used_pct"] == 1.0          # 621.2/60000×100=1.035…
+        assert w["thisweek"]["tokens"] == {"in": 200_000_000, "cr": 90_000_000,
+                                           "out": 18_000_000}
 
     def test_invalid_tier_falls_back_lite(self, tmp_path, monkeypatch):
         monday0, _frozen = self._anchors()
@@ -307,8 +312,10 @@ class TestWidgetCreditWindows:
         mon01 = int(monday0.timestamp() * 1000) + 3600 * 1000
         rows = [("s1", "GLM-5.3", "completed", mon01, 50_000_000, 4_000_000, 0)]
         w = self._run(tmp_path, monkeypatch, rows, tier_value="lite")
-        assert w["window5h"] == {"credits": 0.0, "used_pct": 0.0, "reset_eta_min": None}
+        assert w["window5h"] == {"credits": 0.0, "used_pct": 0.0, "reset_eta_min": None,
+                                 "tokens": {"in": 0, "cr": 0, "out": 0}}
         assert w["thisweek"]["credits"] == 220.5
+        assert w["thisweek"]["tokens"] == {"in": 50_000_000, "cr": 0, "out": 4_000_000}
 
     def test_used_pct_can_exceed_100(self, tmp_path, monkeypatch):
         _monday0, frozen_now = self._anchors()
@@ -374,8 +381,12 @@ class TestRefreshSidecarCredits:
         assert sc["window5h"]["credits"] == 400.7
         assert sc["window5h"]["used_pct"] == 20.0
         assert sc["window5h"]["reset_eta_min"] == 120
+        assert sc["window5h"]["tokens"] == {"in": 150_000_000, "cr": 90_000_000,
+                                            "out": 14_000_000}
         assert sc["thisweek"]["credits"] == 621.2
         assert sc["thisweek"]["used_pct"] == 6.2
+        assert sc["thisweek"]["tokens"] == {"in": 200_000_000, "cr": 90_000_000,
+                                            "out": 18_000_000}
 
 
 # ---------- config：贴纸档位（默认/自愈 lite；向后兼容键集） ----------

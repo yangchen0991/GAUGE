@@ -274,6 +274,25 @@ class TestRefreshSidecar:
             "type": "rate_limited",
             "at": datetime.fromtimestamp(err_ts / 1000).strftime("%H:%M"),
         }
+        # 积分窗口 tokens：5h 窗随运行时刻变化（今日 01:00/03:00 行可能出窗），
+        # 本周窗是否含昨日行取决于今天星期几——按当前时刻独立重算期望值
+        base = int(today0.timestamp() * 1000)
+        now_ms = int(datetime.now().timestamp() * 1000)
+        # (input, output, cache_read, started_at)，与 _make_db 插入行一致
+        tok_rows = [(1_000_000, 100_000, 900_000, base + 3600 * 1000),
+                    (10_000, 1_000, 5_000, base + 3 * 3600 * 1000)]
+        week_rows = tok_rows + [(500_000, 50_000, 0, base - 86400 * 1000 + 10 * 3600 * 1000)]
+        monday_ms = int((today0 - timedelta(days=today0.weekday())).timestamp() * 1000)
+
+        def _sum_in_window(rows, since_ms):
+            picked = [(i, o, cr) for i, o, cr, t in rows if t >= since_ms]
+            if not picked:
+                return {"in": 0, "cr": 0, "out": 0}
+            it, ot, cr = (sum(v) for v in zip(*picked))
+            return {"in": it, "cr": cr, "out": ot}
+
+        assert sc["window5h"]["tokens"] == _sum_in_window(tok_rows, now_ms - 5 * 3600 * 1000)
+        assert sc["thisweek"]["tokens"] == _sum_in_window(week_rows, monday_ms)
         # pricing：含库中出现的模型，值与管线价目快照一致
         assert set(sc["pricing"]) == {"GLM-5.3", "GLM-5.3-Flash"}
         for row in refresh.PRICING_CNY["rows"]:
