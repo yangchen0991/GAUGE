@@ -115,36 +115,30 @@ var
   DbPath: String;
 begin
   Result := True;
-
-  { a) WebView2 Runtime 预检 }
-  if not WebView2Installed() then
-  begin
-    { 静默安装（/SILENT、/VERYSILENT）下跳过模态弹窗，避免无人值守/批量部署卡死；
-      MsgBox 不受静默模式自动抑制，必须显式用 WizardSilent 守卫。 }
-    if not WizardSilent then
+  try
+    { a) WebView2 Runtime 预检 }
+    if not WebView2Installed() then
     begin
-      if MsgBox('未检测到 Microsoft Edge WebView2 Runtime。' + #13#10 + #13#10 +
-                '「GAUGE 衡 · AI Agent 监控台」需要 WebView2 渲染界面。' + #13#10 +
-                '是否现在打开微软官方下载页安装？' + #13#10 + #13#10 +
-                '（可先继续安装，安装完成后再补装 WebView2。）',
-                mbConfirmation, MB_YESNO) = IDYES then
-        ShellExec('open', WEBVIEW2_URL, '', '', SW_SHOWNORMAL, ewNoWait, ErrCode);
+      if not WizardSilent then
+      begin
+        if MsgBox('未检测到 Microsoft Edge WebView2 Runtime。' + #13#10 + #13#10 +
+                  '「GAUGE 衡 · AI Agent 监控台」需要 WebView2 渲染界面。' + #13#10 +
+                  '是否现在打开微软官方下载页安装？' + #13#10 + #13#10 +
+                  '（可先继续安装，安装完成后再补装 WebView2。）',
+                  mbConfirmation, MB_YESNO) = IDYES then
+          ShellExec('open', WEBVIEW2_URL, '', '', SW_SHOWNORMAL, ewNoWait, ErrCode);
+      end;
     end;
+    { b) ZCode 会话库提示性检查，仅提示不阻断 }
+    DbPath := ExpandConstant('{%USERPROFILE}\.zcode\cli\db\db.sqlite');
+    if not FileExists(DbPath) then
+      if not WizardSilent then
+        MsgBox('本机未检测到 ZCode 会话库：' + #13#10 +
+               DbPath + #13#10 + #13#10 +
+               '安装后监控台将无数据，需先安装并运行 ZCode。' + #13#10 +
+               '（仅提示，不影响继续安装。）',
+               mbInformation, MB_OK);
+  except
+    { 预检异常一律忽略：可选检查绝不能阻断安装，这是本次 P0 的治本点 }
   end;
-
-  { b) ZCode 会话库提示性检查（仅提示，不阻断；静默安装跳过弹窗）。
-    路径须用环境变量常量的 Inno 写法：花括号+百分号包裹 USERPROFILE。
-    Inno 无 userprofile 具名常量，且编译期不校验，运行时才报
-    Unknown constant 并致命中止，故此处不可写错。 }
-  DbPath := ExpandConstant('{%USERPROFILE}\.zcode\cli\db\db.sqlite');
-  if not FileExists(DbPath) then
-    if not WizardSilent then
-      MsgBox('本机未检测到 ZCode 会话库：' + #13#10 +
-             DbPath + #13#10 + #13#10 +
-             '安装后监控台将无数据，需先安装并运行 ZCode。' + #13#10 +
-             '（仅提示，不影响继续安装。）',
-             mbInformation, MB_OK);
-
-  { 始终放行：两项检查均为提示性，不阻断安装 }
-  Result := True;
 end;
