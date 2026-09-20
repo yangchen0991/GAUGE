@@ -26,7 +26,7 @@ async (page) => {
     window.__widgetCalls = [];
     window.pywebview = {
       api: {
-        start_drag: () => window.__widgetCalls.push(["start_drag"]),
+        move_widget_by: (dx, dy) => window.__widgetCalls.push(["move_widget_by", dx, dy]),
         open_main: () => window.__widgetCalls.push(["open_main"]),
         open_usage_page: () => window.__widgetCalls.push(["open_usage_page"]),
         toggle_layout: () => window.__widgetCalls.push(["toggle_layout"]),
