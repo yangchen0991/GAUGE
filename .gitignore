@@ -7,6 +7,10 @@ __pycache__/
 
 # 数据快照成品（refresh.py + template.html 可重新生成，含活库快照不入库）
 AI-Agent监控台.html
+AI-Agent监控台.data.json
+# 崩溃窗口残留的原子写临时文件（tmp + os.replace 中断产物）
+AI-Agent监控台.data.json.tmp
+AI-Agent监控台.html.tmp
 brand/
 desktop/widget.json
 desktop/build/
@@ -14,3 +18,10 @@ desktop/dist/
 desktop/__pycache__/
 desktop/monitor/__pycache__/
 AI-Agent监控台.exe
+
+# PyInstaller 构建产物（仓库根执行 desktop/构建EXE.bat 生成；与 desktop/build|dist 条目并存）
+build/
+dist/
+# 会话探针证据与浏览器调试临时目录（本地保留，不入库）
+output/
+.playwright-cli/

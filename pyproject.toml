@@ -1,0 +1,9 @@
+# 工程配置：pytest 与 mypy 统一口径（无需命令行参数）
+# pythonpath 使 pytest 不依赖 conftest 的 sys.path 注入（conftest 保留，双保险无害）
+[tool.pytest.ini_options]
+testpaths = ["desktop/tests"]
+pythonpath = [".", "desktop"]
+
+[tool.mypy]
+files = ["desktop/monitor"]
+ignore_missing_imports = true

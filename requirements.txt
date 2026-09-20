@@ -1,0 +1,6 @@
+# 桌面版运行依赖（desktop/安装依赖.bat 使用）
+# 版本 = 2026-09-19 本机验证版本
+pywebview==6.2.1
+pystray==0.19.5
+pillow==10.4.0
+psutil==7.1.0

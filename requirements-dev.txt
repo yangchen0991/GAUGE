@@ -1,0 +1,5 @@
+# 开发 / 测试 / 打包依赖（含运行依赖）
+-r requirements.txt
+pytest==8.4.2
+mypy==1.18.2
+pyinstaller==6.22.3

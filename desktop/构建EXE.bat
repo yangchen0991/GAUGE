@@ -2,9 +2,9 @@
 rem 中文 Windows 标准代码页，避免 UTF-8 批处理解析错位
 chcp 936 >nul
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
-echo === AI Agent 监控台 - 依赖安装 ===
+echo === AI Agent 监控台 - 构建 EXE ===
 echo.
 
 set "PYCMD="
@@ -24,20 +24,19 @@ if not defined PYCMD (
 echo [1/2] 已检测到 Python:
 %PYCMD% --version
 echo.
-echo [2/2] 正在按 requirements.txt 安装依赖（pywebview 窗口 / pystray 托盘 / pillow 图标 / psutil 内存统计）...
-%PYCMD% -m pip install -r "%~dp0..\requirements.txt"
+echo [2/2] 正在 PyInstaller 打包 desktop/monitor.spec ...
+%PYCMD% -m PyInstaller desktop/monitor.spec --noconfirm
 if errorlevel 1 (
     echo.
-    echo [错误] 依赖安装失败。
-    echo        可能原因: 网络受限或 PyPI 不可达，可尝试国内镜像:
-    echo        %PYCMD% -m pip install -r "%~dp0..\requirements.txt" -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo [错误] 构建失败。请先安装开发/打包依赖后重试:
+    echo        %PYCMD% -m pip install -r "%~dp0..\requirements-dev.txt"
     pause
     exit /b 1
 )
 
 echo.
-echo [完成] 依赖安装成功。
-echo        启动方式一: 双击 [启动监控台.pyw]
-echo        启动方式二: 运行 [创建桌面快捷方式.bat] 固定到桌面
+echo [完成] 构建成功。产物: dist\AI-Agent监控台.exe
+echo        部署方式: 把 dist\AI-Agent监控台.exe 复制到仓库根目录（与 refresh.py、
+echo        template.html 同目录）双击运行；exe 为离线包，不依赖本机 Python 环境。
 pause
 exit /b 0
