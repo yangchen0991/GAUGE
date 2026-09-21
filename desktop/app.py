@@ -69,15 +69,18 @@ from monitor.appenv import (
     SMOKE_PATH, WIDGET_OPACITY_CHOICES, WINDOW_TITLE, log, setup_logging,
 )
 from monitor.config import (
-    load_plan_tier, load_widget_cfg, validate_widget_settings,
+    is_valid_platform, load_plan_tier, load_widget_cfg, validate_widget_settings,
 )
 from monitor.dialogs import error_dialog, webview2_dialog, webview2_installed
-from monitor.refreshctl import auto_refresh_loop, load_sidecar, refresh_once, run_refresh
+from monitor.refreshctl import (
+    auto_refresh_loop, current_widget, platform_tooltip,
+    push_current_platform, refresh_once, run_refresh,
+)
 from monitor.singleinst import bind_single_instance, notify_existing_instance
-from monitor.stats import today_stats, tooltip_text, widget_stats
+from monitor.stats import today_stats
 from monitor.traycore import (
     TRAY, _persist_widget_cfg, apply_widget_cfg, build_icon_image, child_send,
-    notify_user, tray_runtime_status,
+    notify_user, platform_state, tray_runtime_status,
 )
 from monitor.winchild import USAGE_PAGE_URL, window_process_main
 
@@ -90,7 +93,11 @@ _log = logging.getLogger("agent_monitor")
 # ---------- 托盘间隔/菜单辅助 ----------
 def set_interval(secs):
     """切换自动刷新间隔并立即生效（唤醒计时线程按新间隔重排）。"""
-    TRAY.interval_secs = secs
+    with TRAY.platform_lock:
+        TRAY.interval_secs = secs
+        if secs <= 0:
+            TRAY.continuation_pending = False
+            TRAY.continuation_due = 0.0
     TRAY.refresh_wake.set()      # 立即生效：唤醒计时循环
     log("自动刷新间隔切换为 %d 秒" % secs)
     update_menu()
@@ -110,13 +117,21 @@ def update_menu():
 def tray_notify(icon, item):
     """托盘菜单「今日用量气泡」：优先 sidecar 今日包，缺失回退 stats 直查
     （与 refresh_tooltip 同模式——桌面单一统计链的最后一条直查链改造）。"""
-    sc = load_sidecar()
-    if sc is not None:
-        st = sc["today"]
-        log("今日用量气泡（sidecar）")
-    else:
-        st = today_stats()
-        log("sidecar 不可用，今日用量气泡回退直查")
+    with TRAY.platform_lock:
+        platform = TRAY.active_platform
+    data = current_widget(platform)
+    if platform == "codex":
+        today = data.get("today") if isinstance(data.get("today"), dict) else {}
+        requests = today.get("requests")
+        total = today.get("total")
+        if data.get("status") in ("error", "unavailable"):
+            notify_user("Codex 用量", "数据读取失败：%s" % data.get("error", "未知错误"))
+        else:
+            suffix = "%d tokens" % total if isinstance(total, (int, float)) else "Token —"
+            notify_user("Codex 用量", "今日 %s 次 · %s" % (
+                requests if isinstance(requests, (int, float)) else "—", suffix))
+        return
+    st = data.get("today") if isinstance(data.get("today"), dict) else today_stats()
     if "error" in st:
         notify_user("今日用量", "数据读取失败：%s" % st["error"])
     else:
@@ -135,7 +150,13 @@ def tray_open_dir(icon, item):
 
 
 def tray_open_usage(icon, item):
-    """托盘菜单「官方用量页」：默认浏览器打开 Coding Plan 用量页（与贴纸 ↗ 同 URL）。"""
+    """托盘菜单「官方用量页」：ZCode 默认浏览器打开 Coding Plan 用量页；
+    Codex 经 OPEN_QUOTA 走贴纸同一条主面板额度区域锚定路径。"""
+    with TRAY.platform_lock:
+        if TRAY.active_platform == "codex":
+            child_send(("OPEN_QUOTA", None))
+            log("Codex 用量入口定位主面板额度区域（与贴纸一致）")
+            return
     try:
         os.startfile(USAGE_PAGE_URL)
     except Exception:
@@ -251,12 +272,62 @@ def set_widget_tier(tier):
     随后触发一次刷新：refresh.py 会按新档位重新生成 sidecar 的 plan 窗口字段，
     并经 refresh_once 的既有推送链把新数据注入贴纸。
     """
+    with TRAY.platform_lock:
+        if TRAY.active_platform != "zcode":
+            notify_user("贴纸档位", "Codex 平台不使用 ZCode 档位")
+            return False
     TRAY.widget_plan_tier = tier
     _persist_widget_cfg()
     threading.Thread(target=refresh_once, args=("tier",), daemon=True,
                      name="tier-refresh").start()
     update_menu()
     log("贴纸档位切换为 %s" % tier)
+    return True
+
+
+def set_active_platform(platform):
+    """持久化成功后才切换平台，并立即推送缓存，刷新放后台执行。"""
+    if not is_valid_platform(platform):
+        log("拒绝非法平台切换请求：%r" % (platform,))
+        notify_user("平台切换", "平台标识无效")
+        child_send(("PLATFORM_STATE", platform_state()))
+        return False
+    with TRAY.platform_lock:
+        current = TRAY.active_platform
+        if platform == current:
+            state = platform_state()
+        else:
+            if not _persist_widget_cfg(platform):
+                detail = "平台切换未保存，仍使用 %s" % current
+                log(detail)
+                notify_user("平台切换失败", detail)
+                child_send(("PLATFORM_STATE", platform_state()))
+                child_send(("WIDGET_REFRESH_STATE", {
+                    "state": "failed", "detail": detail,
+                    "platform": current, "revision": TRAY.platform_revision,
+                }))
+                return False
+            TRAY.active_platform = platform
+            TRAY.platform_revision += 1
+            state = platform_state()
+    child_send(("PLATFORM_STATE", state))
+    # 切换先推送该平台现有缓存/不可用状态，完整扫描交给后台刷新。
+    push_current_platform(force=False)
+    update_menu()
+    log("活动平台切换为 %s（revision=%d）" % (platform, state["revision"]))
+    if TRAY.pipe is not None:
+        threading.Thread(target=refresh_once, args=("platform",), daemon=True,
+                         name="platform-refresh").start()
+    return True
+
+
+def _platform_item(label, platform):
+    return pystray.MenuItem(
+        label,
+        lambda icon, item: set_active_platform(platform),
+        radio=True,
+        checked=lambda item: TRAY.active_platform == platform,
+    )
 
 
 def _tier_item(label, tier):
@@ -302,6 +373,7 @@ def build_menu():
             pystray.Menu(_tier_item("Lite", "lite"),
                          _tier_item("Pro", "pro"),
                          _tier_item("Max", "max")),
+            enabled=lambda item: TRAY.active_platform == "zcode",
         ),
     )
     return pystray.Menu(
@@ -318,6 +390,11 @@ def build_menu():
         ),
         pystray.MenuItem("运行状态", tray_runtime_status),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "平台",
+            pystray.Menu(_platform_item("ZCode", "zcode"),
+                         _platform_item("Codex", "codex")),
+        ),
         pystray.MenuItem("桌面贴纸", toggle_widget,
                          checked=lambda item: TRAY.widget_visible),
         pystray.MenuItem("贴纸设置", widget_submenu),
@@ -378,10 +455,12 @@ def start_tray():
         error_dialog("托盘图标生成失败（PIL 不可用），无法启动。\n详情见 desktop\\app.log")
         return None
     # 初始标题优先 sidecar：启动兜底刷新刚跑完时 sidecar 已存在且与网页同源
-    sc0 = load_sidecar()
+    with TRAY.platform_lock:
+        platform = TRAY.active_platform
+    sc0 = current_widget(platform)
     TRAY.icon = pystray.Icon(
         "agent-monitor", icon=icon_img,
-        title=tooltip_text(sc0["today"]) if sc0 is not None else tooltip_text(),
+        title=platform_tooltip(sc0, platform),
         menu=build_menu()
     )
     try:
@@ -533,6 +612,25 @@ def child_msg_loop(pipe):
                 _persist_widget_cfg()
                 update_menu()
                 log("贴纸窗口已关闭，widget_visible=False 已落盘")
+        elif isinstance(msg, list) and msg[:1] == ["SET_PLATFORM"] and len(msg) >= 2:
+            # 平台值来自网页桥，必须经过精确白名单和持久化成功门槛。
+            set_active_platform(msg[1])
+        elif isinstance(msg, list) and msg[:1] == ["OPEN_TASK"] and len(msg) >= 3:
+            requested_platform, task_id = msg[1], msg[2]
+            with TRAY.platform_lock:
+                active = TRAY.active_platform
+            if (not is_valid_platform(requested_platform)
+                    or requested_platform != active or requested_platform != "codex"
+                    or not isinstance(task_id, str) or not task_id.strip()):
+                log("拒绝非法/过期任务定位请求：%r" % (msg,))
+                continue
+            # TRAY.pending_task_id 为 traycore 兼容保留字段，本侧不再写入：
+            # 定位信息经 OPEN_TASK 命令直达窗口子进程，主进程无需缓存任务号。
+            child_send(("OPEN_TASK", {
+                "platform": "codex", "thread_id": task_id.strip(),
+            }))
+            child_send("SHOW")
+            log("已请求主面板定位 Codex 任务：%s" % task_id.strip())
         elif msg == "WIDGET_REFRESH_NOW":
             # 贴纸 ↻ 按钮（winchild.WidgetApi.refresh_now）：走既有刷新链，成功后
             # refresh_once 会自动把新 sidecar/直查数据推送回贴纸。
@@ -570,6 +668,10 @@ def run():
     else:
         log("WebView2 检测：%s" % ("已安装" if check else "不确定，继续尝试"))
 
+    # 先载入配置，使托盘标题/平台单选状态与持久化平台一致。
+    cfg = load_widget_cfg()
+    apply_widget_cfg(cfg)
+
     # 托盘（Shell_NotifyIcon 返回值检查必须在 icon.run 之前打好补丁）
     patch_shell_notify()
     icon = start_tray()
@@ -581,8 +683,6 @@ def run():
     # 窗口子进程（携带贴纸配置；主进程是 widget.json 唯一写者）。
     # spawn target 必须是可导入模块中的顶层函数（monitor.winchild.window_process_main），
     # frozen 形态下子进程按模块路径反序列化，定义在 __main__ 会导致引导卡住。
-    cfg = load_widget_cfg()
-    apply_widget_cfg(cfg)
     parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
     proc = multiprocessing.Process(
         target=window_process_main, args=(child_conn, cfg),
@@ -600,17 +700,15 @@ def run():
     # 初始贴纸数据同样优先 sidecar（启动兜底刷新刚跑完时已存在）
     def _initial_widget_push():
         time.sleep(2)
-        sc = load_sidecar()
-        if sc is not None:
-            child_send(("WIDGET_DATA", sc))
-            log("初始贴纸数据已推送（sidecar）")
-        else:
-            child_send(("WIDGET_DATA", widget_stats()))
-            log("初始贴纸数据：sidecar 不可用，回退直查")
+        pushed = push_current_platform(force=True)
+        if pushed is not None:
+            log("初始贴纸数据已推送（%s/r%d）" %
+                (pushed.get("platform"), pushed.get("platform_revision", 0)))
         child_send(("WIDGET_CFG", {"passthrough": TRAY.widget_passthrough,
                                    "pinned": TRAY.widget_pinned,
                                    "opacity": TRAY.widget_opacity}))
         child_send(("WIDGET_PIN", TRAY.widget_pinned))
+        child_send(("PLATFORM_STATE", platform_state()))
 
     threading.Thread(target=_initial_widget_push, daemon=True,
                      name="widget-init").start()

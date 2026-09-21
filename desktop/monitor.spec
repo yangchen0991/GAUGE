@@ -6,13 +6,15 @@
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = Path(SPECPATH).parent          # agent-monitor 仓库根
 DESKTOP = ROOT / "desktop"
 
 a = Analysis(
     [str(DESKTOP / "app.py")],
-    pathex=[str(DESKTOP)],
+    # refresh.py 及其 gauge_data 包按仓库根导入；桌面 monitor 包仍保留。
+    pathex=[str(ROOT), str(DESKTOP)],
     binaries=[],
     datas=[
         # 冻结运行时需要的源码资源（refresh.py 线程内 importlib 加载；
@@ -20,6 +22,8 @@ a = Analysis(
         (str(ROOT / "refresh.py"), "."),
         (str(DESKTOP / "widget.html"), "."),
         (str(ROOT / "template.html"), "."),
+        (str(ROOT / "web" / "codex.js"), "web"),
+        (str(ROOT / "web" / "codex.css"), "web"),
     ],
     hiddenimports=[
         "monitor", "monitor.stats", "monitor.config", "monitor.pin_desktop",
@@ -28,6 +32,7 @@ a = Analysis(
         "monitor.appenv", "monitor.singleinst", "monitor.dialogs",
         "monitor.traycore", "monitor.refreshctl", "monitor.winchild",
         "pystray._util.win32",
+        *collect_submodules("gauge_data"),
     ],
     hookspath=[],
     hooksconfig={},

@@ -208,6 +208,23 @@ body.wx-expanded #week{height:auto;min-height:120px;flex:1}
   min-width:0;margin-top:5px;color:var(--acc);font-size:10.5px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
+.platform-seg{display:flex;gap:3px;margin-left:auto}
+.platform-opt{min-width:54px}
+.codex-only{display:none}
+body.codex-mode .codex-only{display:block}
+body.codex-mode .col-left .card{display:none}
+body.codex-mode #seg-unit{visibility:hidden;pointer-events:none}
+.codex-summary{color:var(--tx2);font:10.5px var(--font-mono);margin-top:4px}
+.token-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 8px;margin-top:7px}
+.token-item{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--tx2);font:10.5px var(--font-mono)}
+.token-item b{color:var(--tx);font-weight:600}
+.quota-line{display:flex;justify-content:space-between;gap:8px;color:var(--tx2);font:10.5px var(--font-mono);margin-top:5px}
+.quota-line span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-list{display:flex;flex-direction:column;gap:4px;margin-top:6px;min-width:0}
+.task-item{display:flex;align-items:center;gap:6px;width:100%;padding:4px 6px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--tx2);cursor:pointer;text-align:left;font-size:10px}
+.task-item:hover{background:var(--hover);color:var(--tx)}
+.task-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.task-state{flex:none;color:var(--tx3);font-size:9px}
 
 footer{
   display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;align-items:center;
@@ -265,7 +282,7 @@ footer{
       </svg>
       <span class="wordmark">GAUGE</span>
       <span class="zh">衡</span>
-      <span class="hsub">AI Agent 监控台</span>
+      <span class="hsub" id="platform-label">AI Agent 监控台</span>
     </div>
     <div class="header-actions">
       <span class="hd-today" id="hd-today">今日 — · — 次</span>
@@ -345,9 +362,34 @@ footer{
         <svg id="week" viewBox="0 0 334 96" preserveAspectRatio="none" role="img" aria-label="近七天本机估算成本"></svg>
         <div id="errbar" role="alert" aria-live="polite"></div>
       </section>
+      <section class="card codex-only" id="codex-card" aria-labelledby="codex-title">
+        <div class="card-head">
+          <span class="tile" aria-hidden="true">C</span>
+          <span class="card-title" id="codex-title">Codex 最近任务</span>
+          <span class="badge" id="codex-coverage">—</span>
+        </div>
+        <div class="codex-summary" id="codex-summary">等待 Codex 快照…</div>
+        <div class="token-grid">
+          <span class="token-item">输入 <b id="codex-in">—</b></span>
+          <span class="token-item">缓存 <b id="codex-cr">—</b></span>
+          <span class="token-item">输出 <b id="codex-out">—</b></span>
+          <span class="token-item">推理 <b id="codex-reasoning">—</b></span>
+        </div>
+        <div class="quota-line"><span>5h <b id="codex-q5">—</b></span><span id="codex-q5-reset">重置 —</span></div>
+        <div class="quota-line"><span>本周 <b id="codex-qw">—</b></span><span id="codex-qw-reset">重置 —</span></div>
+        <div class="quota-line" id="codex-credits" hidden><span id="codex-credits-text"></span></div>
+        <div class="task-list" id="codex-tasks"></div>
+      </section>
     </div>
   </main>
   <div class="settings" id="settings" role="dialog" aria-modal="false" aria-label="贴纸设置" aria-hidden="true" hidden>
+    <div class="s-row">
+      <span class="s-label">平台</span>
+      <div class="platform-seg" id="seg-platform" role="group" aria-label="平台">
+        <button class="s-opt platform-opt sel" data-platform="zcode" aria-pressed="true">ZCode</button>
+        <button class="s-opt platform-opt" data-platform="codex" aria-pressed="false">Codex</button>
+      </div>
+    </div>
     <div class="s-row">
       <span class="s-label">透明度</span>
       <div class="s-seg" id="seg-opacity" role="group" aria-label="透明度">
@@ -492,6 +534,8 @@ var _weekDays=[];
 var _settingsOpen=false;
 var _usageUnit='credits';
 var _lastWidgetData=null;
+var _activePlatform='zcode';
+var _activePlatformRevision=0;
 
 function renderCard(suffix,win,limit){
   var credits=gv(win,'credits');
@@ -538,13 +582,17 @@ function renderWeek(days){
       d:raw.d==null?'—':String(raw.d),
       full:raw.full==null?(raw.d==null?'日期未知':String(raw.d)):String(raw.full),
       req:isNum(raw.req)?raw.req:null,
-      cost:isNum(raw.cost)?Math.max(0,raw.cost):null
+      cost:isNum(raw.cost)?Math.max(0,raw.cost):null,
+      tokens:isNum(raw.tokens)?Math.max(0,raw.tokens):null
     });
   }
   var left=3,right=3,innerWidth=Math.max(1,width-left-right);
   var innerHeight=Math.max(1,height-top-bottom);
   var max=0;
-  for(i=0;i<rows.length;i++)if(rows[i].cost!==null&&rows[i].cost>max)max=rows[i].cost;
+  for(i=0;i<rows.length;i++){
+    var metric=_activePlatform==='codex'?rows[i].tokens:rows[i].cost;
+    if(metric!==null&&metric>max)max=metric;
+  }
   if(max<=0)max=1;
   if(expanded){
     for(i=1;i<=3;i++){
@@ -560,17 +608,19 @@ function renderWeek(days){
   for(i=0;i<rows.length;i++){
     var row=rows[i];
     var cx=left+slot*(i+.5);
-    var barHeight=row.cost===null?0:row.cost/max*innerHeight;
+    var value=_activePlatform==='codex'?row.tokens:row.cost;
+    var barHeight=value===null?0:value/max*innerHeight;
     var rect=svgIn(svg,'rect','wbar');
     rect.setAttribute('x',(cx-barWidth/2).toFixed(1));
     rect.setAttribute('y',(top+innerHeight-Math.max(barHeight,1)).toFixed(1));
     rect.setAttribute('width',barWidth.toFixed(1));
     rect.setAttribute('height',Math.max(barHeight,1).toFixed(1));
     rect.setAttribute('rx','2');
-    rect.setAttribute('fill',row.cost!==null&&row.cost>0?'#FFB300':'rgba(255,255,255,.10)');
-    rect.setAttribute('opacity',row.cost!==null&&row.cost>0?'.88':'1');
+    rect.setAttribute('fill',value!==null&&value>0?'#FFB300':'rgba(255,255,255,.10)');
+    rect.setAttribute('opacity',value!==null&&value>0?'.88':'1');
     var title=svgIn(rect,'title');
-    title.textContent=row.full+'：'+(row.req===null?'—':fmtInt(row.req))+' 次 · '+fmtCost(row.cost);
+    title.textContent=row.full+'：'+(row.req===null?'—':fmtInt(row.req))+' 次 · '+
+      (_activePlatform==='codex'?(value===null?'—':fmtTokens(value)+' tokens'):fmtCost(row.cost));
     var label=svgIn(svg,'text');
     label.setAttribute('x',cx.toFixed(1));label.setAttribute('y',height-3);
     label.setAttribute('text-anchor','middle');label.setAttribute('fill','#858590');
@@ -603,6 +653,126 @@ window.renderWidgetMaterial=function(options){
   shell.setAttribute('data-material',glass?'glass':'solid');
 };
 
+function quotaPercent(win){
+  // quota 为冻结形状：只消费 used_percent，不再探测旧形状的猜测键。
+  if(!win||typeof win!=='object')return null;
+  var value=gv(win,'used_percent');
+  return isNum(value)?value:null;
+}
+function formatResetMs(value){
+  // 冻结形状的时间为毫秒时间戳 resets_at_ms，直接展示；
+  // 与 shortTimestamp 一致只保留时分秒，避免长日期挤占贴纸行宽。
+  if(!isNum(value)||value<=0)return '重置 —';
+  var date=new Date(value);
+  var pad=function(n){return ('0'+n).slice(-2);};
+  return '重置 '+pad(date.getHours())+':'+pad(date.getMinutes())+':'+pad(date.getSeconds());
+}
+function renderCodex(data){
+  var today=gv(data,'today')||{};
+  var total=isNum(today.total)?today.total:null;
+  var requests=isNum(today.requests)?today.requests:null;
+  txt('platform-label','Codex · 本机快照');
+  txt('hd-today','今日 '+(total===null?'—':fmtTokens(total))+' tokens · '+(requests===null?'—':fmtInt(requests))+' 次');
+  txt('chart-title','近 7 天 · Token 用量');
+  var tokens={in:gv(today,'in'),cr:gv(today,'cr'),out:gv(today,'out')};
+  txt('codex-in',fmtTokens(tokens.in));
+  txt('codex-cr',fmtTokens(tokens.cr));
+  txt('codex-out',fmtTokens(tokens.out));
+  txt('codex-reasoning',fmtTokens(gv(today,'reasoning')));
+  // quota 为冻结形状：primary→5h 行、secondary→本周行；两者可为 null
+  // （premium 变体），used_percent 可为 null；resets_at_ms 已是毫秒。
+  var quota=gv(data,'quota');
+  var q5=gv(quota,'primary'),qw=gv(quota,'secondary');
+  var p5=quotaPercent(q5),pw=quotaPercent(qw);
+  txt('codex-q5',p5===null?'暂不可用':fmtPct(p5));
+  txt('codex-qw',pw===null?'暂不可用':fmtPct(pw));
+  txt('codex-q5-reset',formatResetMs(gv(q5,'resets_at_ms')));
+  txt('codex-qw-reset',formatResetMs(gv(qw,'resets_at_ms')));
+  var creditsLine=$('codex-credits');
+  if(creditsLine){
+    var credits=gv(quota,'credits');
+    if(gv(credits,'has_credits')===false){
+      var balance=gv(credits,'balance');
+      creditsLine.hidden=false;
+      txt('codex-credits-text','Codex 额度已用尽'+(balance?' · 余额 '+String(balance):''));
+    }else{
+      creditsLine.hidden=true;
+      txt('codex-credits-text','');
+    }
+  }
+  var coverage=gv(data,'coverage');
+  txt('codex-coverage',coverage&&coverage.complete===true?'完整':(coverage?'索引中':'—'));
+  txt('codex-summary',data.error?'数据不可用：'+String(data.error):
+    '今日 '+(total===null?'—':fmtTokens(total))+' tokens · 输入/缓存/输出/推理');
+  var list=$('codex-tasks');
+  if(list){
+    while(list.firstChild)list.removeChild(list.firstChild);
+    var tasks=Array.isArray(data.recent_tasks)?data.recent_tasks:[];
+    for(var i=0;i<tasks.length&&i<8;i++){
+      var task=tasks[i]||{},id=typeof task.id==='string'?task.id:'';
+      if(!id)continue;
+      var button=document.createElement('button');button.type='button';button.className='task-item';
+      button.setAttribute('data-task-id',id);
+      var title=document.createElement('span');title.className='task-title';title.textContent=task.title||id;
+      var state=document.createElement('span');state.className='task-state';
+      var status=task.status==null?'—':String(task.status);
+      if(status==='inProgress'||status==='in_progress'||status==='running')status='记录未结束';
+      state.textContent=status;
+      button.appendChild(title);button.appendChild(state);list.appendChild(button);
+    }
+  }
+  var week=Array.isArray(data.week)?data.week:[];
+  renderWeek(week);
+  var parsed=parseTimestamp(gv(data,'generated_at'));
+  var complete=!!parsed&&data.status!=='unavailable'&&data.status!=='error'&&
+    (!coverage||coverage.complete===true);
+  renderStatusFromData(data,complete);
+  if(data.error||data.status==='unavailable'||data.status==='error'){
+    setDot('err','Codex 数据不可用');
+    setError('Codex 数据不可用：请从托盘执行立即刷新，或确认 Codex 数据已导出');
+  }else if(data.warnings&&data.warnings.length){
+    setError(String(data.warnings[0]));
+  }else{
+    setError('');
+  }
+}
+
+window.gaugeApplyPlatform=function(state){
+  if(!state||!isValidPlatformValue(state.platform))return false;
+  var revision=state.revision;
+  if(!isNum(revision)||revision<0)return false;
+  if(revision<_activePlatformRevision)return false;
+  _activePlatform=state.platform;_activePlatformRevision=revision;
+  document.body.classList.toggle('codex-mode',_activePlatform==='codex');
+  setPlatformSel(_activePlatform);
+  txt('platform-label',_activePlatform==='codex'?'Codex · 本机快照':'AI Agent 监控台');
+  setUsageUnit(_activePlatform==='codex'?'tokens':'credits');
+  if(_lastWidgetData)renderWidget(_lastWidgetData);
+  return true;
+};
+function isValidPlatformValue(value){return value==='zcode'||value==='codex';}
+function setPlatformSel(value){
+  var buttons=document.querySelectorAll('#seg-platform .platform-opt');
+  for(var i=0;i<buttons.length;i++){
+    var selected=buttons[i].getAttribute('data-platform')===value;
+    buttons[i].classList[selected?'add':'remove']('sel');
+    buttons[i].setAttribute('aria-pressed',selected?'true':'false');
+  }
+}
+window.gaugeOpenTask=function(id){
+  if(_activePlatform!=='codex'||typeof id!=='string'||!id)return false;
+  var result=callApi('open_task',id);
+  if(result===null)return false;
+  // 桥调用返回 Promise，不能同步比较 ===true；未确认时给出可见反馈。
+  if(result&&typeof result.then==='function'){
+    result.then(function(accepted){
+      if(accepted!==true)showSettingsFeedback('任务定位请求失败');
+    }).catch(function(){showSettingsFeedback('任务定位请求失败');});
+    return true;
+  }
+  return result===true;
+};
+
 function renderStatusFromData(data,complete){
   var parsed=parseTimestamp(gv(data,'generated_at'));
   var title;
@@ -632,7 +802,16 @@ function renderStatusFromData(data,complete){
 
 function renderWidget(data){
   try{
+    var dataPlatform=data&&typeof data==='object'&&data.platform?data.platform:'zcode';
+    var dataRevision=data&&typeof data==='object'?data.platform_revision:null;
+    if(!isValidPlatformValue(dataPlatform)||dataPlatform!==_activePlatform)return;
+    if(dataRevision!==null&&dataRevision!==undefined&&
+      (!isNum(dataRevision)||dataRevision!==_activePlatformRevision))return;
     _lastWidgetData=data;
+    document.body.classList.toggle('codex-mode',dataPlatform==='codex');
+    if(dataPlatform==='codex'){renderCodex(data);return;}
+    txt('platform-label','AI Agent 监控台');
+    txt('chart-title','近 7 天 · 估算成本');
     if(!data||data.error){
       setDot('err','刷新失败；保留上次有效读数');
       txt('st-text','刷新失败');
@@ -845,6 +1024,50 @@ for(var bi=0;bi<unitButtons.length;bi++){
     });
   })(unitButtons[bi]);
 }
+var platformButtons=document.querySelectorAll('#seg-platform .platform-opt');
+for(var pi=0;pi<platformButtons.length;pi++){
+  (function(button){
+    button.addEventListener('click',function(){
+      var value=button.getAttribute('data-platform');
+      var result=callApi('set_platform',value);
+      if(result===null){showSettingsFeedback('桌面桥不可用，平台未切换');return;}
+      // 桥调用返回 Promise（参照 get_platform 的既有写法），不能与 true 直接比较。
+      var done=function(accepted){
+        showSettingsFeedback(accepted===true?'平台切换请求已发送，等待主进程确认':'平台切换请求失败');
+      };
+      if(result&&typeof result.then==='function'){
+        result.then(done).catch(function(){done(false);});
+      }else done(result);
+    });
+  })(platformButtons[pi]);
+}
+$('codex-tasks').addEventListener('click',function(event){
+  // 事件委托：任务列表每次渲染重建，委托到容器只需绑定一次。
+  var target=event.target&&event.target.closest?event.target.closest('button.task-item'):null;
+  if(!target)return;
+  var id=target.getAttribute('data-task-id');
+  if(id&&!window.gaugeOpenTask(id))showSettingsFeedback('任务定位请求失败');
+});
+window.addEventListener('pywebviewready',function(){
+  var result=callApi('get_platform');
+  if(result===null){
+    showSettingsFeedback('桌面桥不可用，使用默认 ZCode 平台');
+    window.gaugeApplyPlatform({platform:'zcode',revision:0});
+  }else if(result&&typeof result.then==='function'){
+    result.then(function(state){
+      if(!window.gaugeApplyPlatform(state)){
+        window.gaugeApplyPlatform({platform:'zcode',revision:0});
+        showSettingsFeedback('读取平台状态失败，已回退默认 ZCode 平台');
+      }
+    }).catch(function(){
+      // 读取失败不静默：回退默认平台并给出可见反馈。
+      window.gaugeApplyPlatform({platform:'zcode',revision:0});
+      showSettingsFeedback('读取平台状态失败，已回退默认 ZCode 平台');
+    });
+  }else{
+    window.gaugeApplyPlatform(result);
+  }
+});
 var _drag=null;
 function _dragMove(e){
   if(!_drag)return;

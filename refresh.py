@@ -222,6 +222,11 @@ def load_template():
     n_ph = tpl.count(PLACEHOLDER)
     if n_ph != 1:
         die("模板中数据占位符出现 %d 次（应恰好为 1 次），模板可能已损坏。" % n_ph)
+    for marker, filename in (("/*__CODEX_STYLE__*/", "codex.css"),
+                             ("/*__CODEX_SCRIPT__*/", "codex.js")):
+        if marker in tpl:
+            asset = Path(BASE_DIR) / "web" / filename
+            tpl = tpl.replace(marker, asset.read_text(encoding="utf-8"))
     return tpl
 
 
@@ -510,7 +515,8 @@ def serialize_and_inject(tpl, payload, n_sess):
     校验链：JSON 回读可解析、sessions 长度与会话数一致、占位符恰好消耗一次、
     成品不含外部 URL 的 src/href。任一失败 die（旧成品保留）。
     """
-    json_str = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    legacy = {key: value for key, value in payload.items() if key != "codex"}
+    json_str = json.dumps(legacy, ensure_ascii=False, separators=(",", ":"))
     try:
         back = json.loads(json_str)
     except ValueError as e:
@@ -527,6 +533,13 @@ def serialize_and_inject(tpl, payload, n_sess):
     js = json_str.replace("<", "\\u003c") \
                  .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
     out = tpl.replace(PLACEHOLDER, js)
+    # Codex 展示脚本与旧页面共享同一个导出批次，注入前沿用相同转义规则。
+    extra = json.dumps(payload.get("codex"), ensure_ascii=False, separators=(",", ":"))
+    extra = extra.replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    meta = json.dumps(payload.get("meta", {}), ensure_ascii=False).replace("<", "\\u003c") \
+        .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    out = out.replace("/*__PLATFORM_DATA__*/", "window.GAUGE_CODEX=" + extra
+                      + ";window.GAUGE_ZCODE_META=" + meta + ";")
     if PLACEHOLDER in out:
         die("占位符替换后仍残留占位符，中止写入。")
     if re.search(r'(src|href)\s*=\s*["\']https?://', out, re.I):
@@ -537,7 +550,7 @@ def serialize_and_inject(tpl, payload, n_sess):
 # ---------- 步骤 7：原子写入 ----------
 def atomic_write(out):
     """tmp + os.replace 原子写入成品；失败保留旧文件。"""
-    tmp_out = OUTPUT_PATH + ".tmp"
+    tmp_out = str(OUTPUT_PATH) + ".tmp"
     try:
         with open(tmp_out, "w", encoding="utf-8", errors="replace", newline="\n") as f:
             f.write(out)
@@ -616,8 +629,8 @@ def _sidecar_plan_tier():
     return DEFAULT_PLAN_TIER
 
 
-def write_sidecar(scan_mu, meta_generated_at):
-    """从已聚合数据计算桌面所需紧凑包并原子写 sidecar JSON（步骤 8）。
+def build_zcode_widget(scan_mu, meta_generated_at):
+    """从同一批已聚合数据计算 ZCode 贴纸内容，由 write_sidecar 统一写出。
 
     不再查库：全部数据来自 scan_mu["req_raw"] 行扫描结果，与成品 HTML 同一
     WAL 快照、同一口径，保证桌面统计链与网页完全一致。
@@ -649,7 +662,6 @@ def write_sidecar(scan_mu, meta_generated_at):
     写失败仅打印警告、不影响退出码：HTML 是主交付物，桌面侧对 sidecar 缺失
     有 stats 直查回退。返回 True=成功。
     """
-    sidecar_path = OUTPUT_PATH[:-5] + ".data.json"
     today0 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     midnight_ms = int(today0.timestamp() * 1000)          # 本地今日零点（epoch 毫秒）
     week0_ms = midnight_ms - 6 * 86400 * 1000             # 近 7 天（含今日）起点
@@ -749,6 +761,22 @@ def write_sidecar(scan_mu, meta_generated_at):
                      "used_pct": round(week_credits / week_limit * 100, 1),
                      "tokens": {"in": week_tin, "cr": week_tcr, "out": week_tout}},
     }
+    data["platform"] = "zcode"
+    data["status"] = "ready"
+    return data
+
+
+def write_sidecar(scan_mu, meta_generated_at, codex=None, zcode_error=None):
+    """写双平台桌面快照；保留旧版顶层字段，平台失败不会伪装成另一平台。"""
+    from gauge_data import codex_widget
+    data = build_zcode_widget(scan_mu, meta_generated_at)
+    if zcode_error:
+        data.update(status="unavailable", error=zcode_error)
+    platforms = {"zcode": dict(data)}
+    if codex is not None:
+        platforms["codex"] = codex_widget(codex)
+    data.update(schema_version=2, platforms=platforms)
+    sidecar_path = str(Path(OUTPUT_PATH).with_suffix(".data.json"))
     tmp = sidecar_path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
@@ -766,17 +794,10 @@ def write_sidecar(scan_mu, meta_generated_at):
     return True
 
 
-def main():
-    """数据管线编排：九步顺序执行，任一步失败 die（旧成品保留）。
-
-    返回退出码：0 成功。会话总数经 (行数, SQL COUNT) 双路径采集后传入自检。
-    步骤 8（sidecar）例外：写失败仅警告，不影响退出码（桌面侧有回退）。
-    """
+def collect_zcode():
+    """在一个只读事务中采集并校验 ZCode，返回页面数据和贴纸聚合结果。"""
     print("=== AI Agent 监控台 数据刷新 ===")
     print("数据库（只读）：" + DB_PATH)
-
-    # ---- 1. 模板 ----
-    tpl = load_template()
 
     # ---- 2. 只读打开数据库（单快照）----
     conn = open_db()
@@ -820,18 +841,7 @@ def main():
         # ---- 5. 组装 DATA ----
         payload = build_payload(scan_mu, scan_tu, sess_rows)
 
-        # ---- 6. 序列化注入 + 语法/外链检查 ----
-        out = serialize_and_inject(tpl, payload, n_sess)
-        node_ok = node_syntax_check(out)
-        if node_ok:
-            print("JS 语法检查（node --check）：OK（%d 个内联脚本）" % len(re.findall(r"<script\b", out)))
-
-        # ---- 7. 原子写入 ----
-        atomic_write(out)
-
-        # ---- 8. 桌面 sidecar（单一统计链；失败仅警告，不影响退出码）----
-        # generated_at 与 DATA.meta 同源同值，保证网页与桌面显示同一刷新时刻
-        write_sidecar(scan_mu, payload["meta"]["generated_at"])
+        return payload, scan_mu
     finally:
         try:
             conn.execute("COMMIT")
@@ -839,17 +849,38 @@ def main():
             pass
         conn.close()
 
-    size = os.path.getsize(OUTPUT_PATH)
-    agg = scan_mu["agg"]
-    print("--- 完成 ---")
-    print("会话 %d · 请求 %d · 工具记录 %d · 错误类型 %d 种"
-          % (len(payload["sessions"]), agg["req"], scan_tu["total"], len(scan_mu["err_types"])))
-    min_t, max_t = scan_mu["min_t"], scan_mu["max_t"]
-    print("时间范围：%s ~ %s"
-          % (datetime.fromtimestamp(min_t / 1000).strftime("%Y-%m-%d %H:%M") if min_t else "—",
-             datetime.fromtimestamp(max_t / 1000).strftime("%Y-%m-%d %H:%M") if max_t else "—"))
-    print("成品：%s（%.2f MB）" % (OUTPUT_PATH, size / 1048576.0))
-    print("双击 AI-Agent监控台.html 即可打开。")
+
+def main():
+    """生成双平台快照；关闭 ZCode 读事务后再增量读取 Codex，避免长事务。"""
+    from gauge_data import collect_codex
+    tpl = load_template()
+    zcode_error = None
+    if os.path.isfile(DB_PATH):
+        payload, scan_mu = collect_zcode()
+        payload["meta"].update(available=True, status="ready", platform="zcode")
+    else:
+        zcode_error = "未找到 ZCode 数据库，请检查安装位置或选择 Codex。"
+        scan_mu = {"req_raw": []}
+        payload = {
+            "meta": {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                     "platform": "zcode", "available": False, "status": "unavailable",
+                     "error": zcode_error, "db_path": DB_DISPLAY, "range": [None, None],
+                     "orphans": 0, "counts": {"sessions": 0, "requests": 0, "tools": 0,
+                                              "selfcheck_pass": False}},
+            "agents": [], "providers": [], "models": [], "sessions": [], "requests": [],
+            "tools": [], "pricing": PRICING_CNY, "pricing_usd": PRICING_USD,
+            "agg": {"err_types": {}},
+        }
+    # 单次读取预算可供候选构建验证调整；正常后台刷新自动续读缓存。
+    codex = collect_codex()
+    # 避免大型 Codex 载荷同时复制到旧 DATA 和独立全局变量。
+    payload["codex"] = codex
+    out = serialize_and_inject(tpl, payload, len(payload["sessions"]))
+    node_syntax_check(out)
+    atomic_write(out)
+    write_sidecar(scan_mu, payload["meta"]["generated_at"], codex, zcode_error)
+    print("双平台快照：ZCode %s；Codex %s" % (payload["meta"]["status"], codex.get("status")))
+    print("成品：%s（%.2f MB）" % (OUTPUT_PATH, os.path.getsize(OUTPUT_PATH) / 1048576.0))
     return 0
 
 

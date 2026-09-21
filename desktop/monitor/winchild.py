@@ -26,8 +26,8 @@ from monitor.appenv import (
     WIDGET_TITLE, WINDOW_TITLE, log, setup_logging,
 )
 from monitor.config import (
-    DEFAULTS, WIDGET_DEFAULT_POS, validate_widget_settings,
-    widget_settings_from_cfg,
+    DEFAULT_ACTIVE_PLATFORM, DEFAULTS, is_valid_platform, WIDGET_DEFAULT_POS,
+    validate_widget_settings, widget_settings_from_cfg,
 )
 from monitor.pin_desktop import pin_to_desktop, unpin_from_desktop
 
@@ -60,9 +60,14 @@ class _WindowState:
         self.widget_ready = threading.Event()
         self.widget_native_hwnd: Optional[int] = None
         self.exiting = False
-        # 最近一次贴纸数据（WIDGET_DATA payload）：销毁重建后经 loaded 钩子
-        # 立即重注入，避免贴纸空白等待下一次刷新。
-        self.last_widget_data: Optional[Dict[str, Any]] = None
+        self.platform_lock = threading.RLock()
+        self.active_platform = DEFAULT_ACTIVE_PLATFORM
+        self.platform_revision = 0
+        self.platform_data: Dict[str, Optional[Dict[str, Any]]] = {
+            "zcode": None, "codex": None,
+        }
+        self.pending_open_task_id: Optional[str] = None
+        self.pending_open_quota = False
         # 初始贴纸配置缓存 = config.DEFAULTS（与原字面量等价；仅键集多出 pinned，
         # 子进程内只做 .get 读取，不回传、不持久化）
         self.cfg: Dict[str, Any] = dict(DEFAULTS)
@@ -73,8 +78,33 @@ class _WindowState:
 
 
 def on_loaded(state: "_WindowState") -> None:
-    """主面板 loaded 事件：标记窗口就绪并留日志。"""
+    """主面板 loaded 后恢复平台状态与待定位任务。"""
     state.window_ready.set()
+    try:
+        with state.platform_lock:
+            platform_payload = {
+                "platform": state.active_platform,
+                "revision": state.platform_revision,
+            }
+            task_id = state.pending_open_task_id
+        script = "if(window.gaugeApplyPlatform)gaugeApplyPlatform(%s);" % json.dumps(
+            platform_payload, ensure_ascii=False)
+        if task_id:
+            script += "if(window.gaugeOpenTask)gaugeOpenTask(%s);" % json.dumps(task_id)
+        with state.platform_lock:
+            open_quota = bool(state.pending_open_quota)
+        if open_quota:
+            script += "if(window.gaugeOpenQuota)gaugeOpenQuota();"
+        state.window.evaluate_js(script)
+        if task_id:
+            with state.platform_lock:
+                if state.pending_open_task_id == task_id:
+                    state.pending_open_task_id = None
+        if open_quota:
+            with state.platform_lock:
+                state.pending_open_quota = False
+    except Exception:
+        _log.exception("[win] 主面板平台/任务状态恢复失败")
     log("页面加载完成：%s" % HTML_PATH.name)
 
 
@@ -291,6 +321,80 @@ def _apply_rounded_region(widget: Any, state: "_WindowState") -> None:
     except Exception:
         _log.exception("[win] 贴纸圆角裁剪失败")
 
+
+def _send_child_message(message: Any) -> bool:
+    """网页桥统一经子进程端 Pipe 上行，避免各 API 自建通信路径。"""
+    try:
+        pipe = _CHILD_PIPE[0]
+        if pipe is None:
+            return False
+        with _CHILD_PIPE_LOCK:
+            pipe.send(message)
+        return True
+    except Exception:
+        _log.exception("[win] 网页桥消息发送失败：%r", message)
+        return False
+
+
+def _open_codex_quota(state: "_WindowState") -> bool:
+    """Codex 的用量入口定位主面板额度区域，不打开 ZCode 外链。"""
+    try:
+        with state.platform_lock:
+            if state.active_platform != "codex":
+                return False
+            state.pending_open_quota = True
+        if state.window is not None:
+            state.window.show()
+        if state.window_ready.is_set() and state.window is not None:
+            state.window.evaluate_js("if(window.gaugeOpenQuota)gaugeOpenQuota();")
+            with state.platform_lock:
+                state.pending_open_quota = False
+        return True
+    except Exception:
+        _log.exception("[win] Codex 额度区域定位失败")
+        return False
+
+
+class MainApi:
+    """主面板 js_api：平台切换/任务定位请求仍由托盘主进程裁决。"""
+
+    def __init__(self, state: "_WindowState") -> None:
+        self._state = state
+
+    def get_platform(self) -> Dict[str, Any]:
+        with self._state.platform_lock:
+            return {"platform": self._state.active_platform,
+                    "revision": int(self._state.platform_revision)}
+
+    def set_platform(self, platform: Any) -> bool:
+        if not is_valid_platform(platform):
+            return False
+        return _send_child_message(["SET_PLATFORM", platform])
+
+    def open_task(self, thread_id: Any) -> bool:
+        with self._state.platform_lock:
+            platform = self._state.active_platform
+        if platform != "codex" or not isinstance(thread_id, str) or not thread_id.strip():
+            return False
+        return _send_child_message(["OPEN_TASK", platform, thread_id.strip()])
+
+    def refresh_now(self) -> bool:
+        """主面板与贴纸共用既有立即刷新消息。"""
+        return _send_child_message("WIDGET_REFRESH_NOW")
+
+    def open_usage_page(self) -> bool:
+        with self._state.platform_lock:
+            platform = self._state.active_platform
+        if platform == "codex":
+            return _open_codex_quota(self._state)
+        try:
+            os.startfile(USAGE_PAGE_URL)
+            return True
+        except Exception:
+            _log.exception("[win] 打开官方用量页失败：%s" % USAGE_PAGE_URL)
+            return False
+
+
 class WidgetApi:
     """贴纸页面的 js_api。
 
@@ -300,6 +404,23 @@ class WidgetApi:
 
     def __init__(self, state: "_WindowState") -> None:
         self._state = state
+
+    def get_platform(self) -> Dict[str, Any]:
+        with self._state.platform_lock:
+            return {"platform": self._state.active_platform,
+                    "revision": int(self._state.platform_revision)}
+
+    def set_platform(self, platform: Any) -> bool:
+        if not is_valid_platform(platform):
+            return False
+        return _send_child_message(["SET_PLATFORM", platform])
+
+    def open_task(self, thread_id: Any) -> bool:
+        with self._state.platform_lock:
+            platform = self._state.active_platform
+        if platform != "codex" or not isinstance(thread_id, str) or not thread_id.strip():
+            return False
+        return _send_child_message(["OPEN_TASK", platform, thread_id.strip()])
 
     def open_main(self) -> bool:
         """展开主面板窗口（贴纸 footer ⚙ 按钮）。"""
@@ -313,6 +434,10 @@ class WidgetApi:
 
     def open_usage_page(self) -> bool:
         """打开官方用量页（贴纸 footer ↗ 按钮，默认浏览器）。"""
+        with self._state.platform_lock:
+            platform = self._state.active_platform
+        if platform == "codex":
+            return _open_codex_quota(self._state)
         try:
             os.startfile(USAGE_PAGE_URL)
             return True
@@ -485,16 +610,24 @@ def on_widget_loaded(state: "_WindowState", widget: Any = None) -> None:
         glass = bool(hwnd and apply_acrylic_backdrop(hwnd))
         if hwnd:
             set_click_through(hwnd, bool(state.cfg.get("passthrough")))
+        with state.platform_lock:
+            platform_payload = {
+                "platform": state.active_platform,
+                "revision": state.platform_revision,
+            }
+            current_data = state.platform_data.get(state.active_platform)
         script = (
+            "if(window.gaugeApplyPlatform)gaugeApplyPlatform(%s);"
             "renderWidgetSettings(%s);renderWidgetLayout(%s);"
             "if(window.renderWidgetMaterial)renderWidgetMaterial(%s);"
         ) % (
+            json.dumps(platform_payload, ensure_ascii=False),
             json.dumps(widget_settings_from_cfg(state.cfg)),
             json.dumps(state.layout), json.dumps({"glass": glass}),
         )
-        if state.last_widget_data is not None:
+        if current_data is not None:
             script += "renderWidget(%s);" % json.dumps(
-                state.last_widget_data, ensure_ascii=False)
+                current_data, ensure_ascii=False)
         widget.evaluate_js(script)
         log("[win] 贴纸初始化完成（%s，glass=%s）" % (state.layout, glass))
     except Exception:
@@ -594,6 +727,9 @@ def _window_cmd_loop(state: "_WindowState", pipe: Any) -> None:
       ("WIDGET_CFG", {"passthrough":bool,"opacity":float,"pinned":bool})
       ("WIDGET_DATA", stats_dict)
       ("WIDGET_REFRESH_STATE", {"state":"refreshing"|"failed", ...})
+      ("PLATFORM_STATE", {"platform":"zcode"|"codex", "revision":int})
+      ("OPEN_TASK", {"platform":"codex", "thread_id":str})
+      ("OPEN_QUOTA", None)
     子→主反向消息：["WIDGET_POS", x, y]（拖动去抖）、"WIDGET_STATE:hidden"。
     """
     while True:
@@ -642,6 +778,66 @@ def _window_cmd_loop(state: "_WindowState", pipe: Any) -> None:
             except Exception:
                 pass
             return
+        elif cmd == "PLATFORM_STATE":
+            if not isinstance(payload, dict):
+                continue
+            platform = payload.get("platform")
+            revision = payload.get("revision")
+            if (not is_valid_platform(platform) or isinstance(revision, bool)
+                    or not isinstance(revision, int) or revision < 0):
+                log("[win] 忽略非法 PLATFORM_STATE：%r" % (payload,))
+                continue
+            with state.platform_lock:
+                if revision < state.platform_revision:
+                    log("[win] 丢弃旧平台 revision：%r" % (payload,))
+                    continue
+                state.active_platform = platform
+                state.platform_revision = revision
+                cached = state.platform_data.get(platform)
+                if (cached is not None and platform != "zcode"
+                        and cached.get("platform_revision") != revision):
+                    cached = None
+            try:
+                platform_script = "if(window.gaugeApplyPlatform)gaugeApplyPlatform(%s);" % json.dumps(
+                    {"platform": platform, "revision": revision}, ensure_ascii=False)
+                widget_script = platform_script
+                if cached is not None:
+                    widget_script += "renderWidget(%s);" % json.dumps(cached, ensure_ascii=False)
+                # 主面板同步不能等待隐藏/销毁的贴纸；贴纸 loaded 钩子会重放当前缓存。
+                if state.widget is not None and state.widget_ready.is_set():
+                    state.widget.evaluate_js(widget_script)
+                if state.window_ready.is_set() and state.window is not None:
+                    state.window.evaluate_js(platform_script)
+            except Exception:
+                _log.exception("[win] 平台状态注入失败")
+        elif cmd == "OPEN_TASK":
+            if not isinstance(payload, dict):
+                continue
+            platform = payload.get("platform")
+            task_id = payload.get("thread_id")
+            if platform != "codex" or not isinstance(task_id, str) or not task_id.strip():
+                log("[win] 忽略非法 OPEN_TASK：%r" % (payload,))
+                continue
+            with state.platform_lock:
+                if state.active_platform != "codex":
+                    continue
+                state.pending_open_task_id = task_id.strip()
+            try:
+                if state.window is not None:
+                    state.window.show()
+                if state.window_ready.is_set() and state.window is not None:
+                    state.window.evaluate_js("if(window.gaugeOpenTask)gaugeOpenTask(%s);" %
+                                             json.dumps(task_id.strip(), ensure_ascii=False))
+                    with state.platform_lock:
+                        if state.pending_open_task_id == task_id.strip():
+                            state.pending_open_task_id = None
+            except Exception:
+                _log.exception("[win] Codex 任务定位失败")
+        elif cmd == "OPEN_QUOTA":
+            # 托盘「官方用量页」在 Codex 平台复用贴纸 ↗ 的同一条锚定路径
+            # （_open_codex_quota → gaugeOpenQuota），不打开 ZCode 外链。
+            if not _open_codex_quota(state):
+                log("[win] OPEN_QUOTA 额度区域定位失败")
         elif cmd == "WIDGET_SHOW":
             log("[win] 收到 WIDGET_SHOW → 显示贴纸")
             try:
@@ -686,6 +882,13 @@ def _window_cmd_loop(state: "_WindowState", pipe: Any) -> None:
                 log("[win] 忽略非法 WIDGET_CFG：%r" % (payload,))
         elif cmd == "WIDGET_REFRESH_STATE":
             if isinstance(payload, dict):
+                with state.platform_lock:
+                    expected_platform = state.active_platform
+                    expected_revision = state.platform_revision
+                if (payload.get("platform") not in (None, expected_platform)
+                        or (isinstance(payload.get("revision"), int)
+                            and payload.get("revision") != expected_revision)):
+                    continue
                 try:
                     state.widget_ready.wait(5)
                     state.widget.evaluate_js(
@@ -696,7 +899,24 @@ def _window_cmd_loop(state: "_WindowState", pipe: Any) -> None:
                     _log.exception("[win] 刷新状态注入失败")
         elif cmd == "WIDGET_DATA":
             if isinstance(payload, dict):
-                state.last_widget_data = payload   # 缓存：贴纸销毁重建后立即重注入
+                payload_platform = payload.get("platform", "zcode")
+                payload_revision = payload.get("platform_revision")
+                with state.platform_lock:
+                    expected_platform = state.active_platform
+                    expected_revision = state.platform_revision
+                if payload_platform != expected_platform:
+                    log("[win] 丢弃跨平台 WIDGET_DATA：%r" % payload_platform)
+                    continue
+                if payload_revision is not None:
+                    if (isinstance(payload_revision, bool)
+                            or not isinstance(payload_revision, int)
+                            or payload_revision != expected_revision):
+                        log("[win] 丢弃旧/未来 WIDGET_DATA revision：%r" % payload_revision)
+                        continue
+                elif payload_platform != "zcode":
+                    log("[win] 丢弃缺少 revision 的 Codex WIDGET_DATA")
+                    continue
+                state.platform_data[payload_platform] = dict(payload)
                 try:
                     state.widget_ready.wait(5)   # 页面未就绪时等待，避免注入丢失
                     state.widget.evaluate_js(
@@ -721,6 +941,9 @@ def window_process_main(pipe: Any, widget_cfg: Optional[Dict[str, Any]] = None) 
     state = _WindowState()
     if isinstance(widget_cfg, dict):
         state.cfg.update(widget_cfg)
+        active_platform = widget_cfg.get("active_platform")
+        if is_valid_platform(active_platform):
+            state.active_platform = active_platform
 
     try:
         window = webview.create_window(
@@ -729,6 +952,7 @@ def window_process_main(pipe: Any, widget_cfg: Optional[Dict[str, Any]] = None) 
             width=1280,
             height=820,
             min_size=(960, 600),
+            js_api=MainApi(state),
         )
         _CHILD_PIPE[0] = pipe
         state.widget = webview.create_window(

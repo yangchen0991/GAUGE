@@ -29,6 +29,11 @@ WIDGET_DEFAULT_POS = (1400, 140)
 WIDGET_SETTING_FIELDS = frozenset(("opacity", "pinned", "passthrough"))
 WIDGET_OPACITY_VALUES = (0.60, 0.75, 0.90)
 
+# 平台标识是跨进程公开协议的一部分。桥接入口只接受这两个精确字符串；
+# 配置文件缺失或损坏时仍按旧版本语义回到 ZCode。
+PLATFORMS: Tuple[str, ...] = ("zcode", "codex")
+DEFAULT_ACTIVE_PLATFORM = "zcode"
+
 DEFAULTS: Dict[str, Any] = {
     "visible": True, "passthrough": False, "pinned": False, "opacity": 0.75,
     "x": WIDGET_DEFAULT_POS[0], "y": WIDGET_DEFAULT_POS[1],
@@ -83,6 +88,16 @@ def norm_plan_tier(v: Any) -> str:
     return v if isinstance(v, str) and v in PLAN_TIERS else DEFAULT_PLAN_TIER
 
 
+def is_valid_platform(v: Any) -> bool:
+    """判断网页/IPC 平台值；必须是精确的 JSON 字符串。"""
+    return isinstance(v, str) and v in PLATFORMS
+
+
+def norm_active_platform(v: Any) -> str:
+    """配置文件的自愈归一化；桥接输入请使用 is_valid_platform 拒绝非法值。"""
+    return v if is_valid_platform(v) else DEFAULT_ACTIVE_PLATFORM
+
+
 def load_widget_cfg(path: Path = WIDGET_CFG_PATH) -> Dict[str, Any]:
     """读取贴纸配置；缺失/损坏时返回默认值（自愈）。"""
     cfg = dict(DEFAULTS)
@@ -102,6 +117,10 @@ def load_widget_cfg(path: Path = WIDGET_CFG_PATH) -> Dict[str, Any]:
             pt = raw.get("plan_tier")
             if isinstance(pt, str) and pt in PLAN_TIERS:
                 cfg["plan_tier"] = pt
+            # 保持旧 DEFAULTS/旧配置缺省键集不变；只有文件明确携带合法平台时透出。
+            platform = raw.get("active_platform")
+            if is_valid_platform(platform):
+                cfg["active_platform"] = platform
     except FileNotFoundError:
         pass
     except Exception:
@@ -125,6 +144,9 @@ def save_widget_cfg(cfg: Dict[str, Any], path: Path = WIDGET_CFG_PATH) -> bool:
         # 携带档位（贴纸批次 2 接线），切档位后不会被任何托盘/位置保存覆盖。
         if "plan_tier" in cfg:
             payload["plan_tier"] = norm_plan_tier(cfg.get("plan_tier"))
+        # 与 plan_tier 相同：旧调用不新增键，新主进程保存路径始终携带当前平台。
+        if "active_platform" in cfg:
+            payload["active_platform"] = norm_active_platform(cfg.get("active_platform"))
         data = json.dumps(payload, ensure_ascii=False, indent=2)
         tmp = str(path) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:

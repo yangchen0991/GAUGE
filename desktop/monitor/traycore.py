@@ -12,7 +12,10 @@ import time
 from typing import Any, Dict, Tuple, Union
 
 from monitor.appenv import ICO_PATH, NOTIFY_MAX, log
-from monitor.config import WIDGET_DEFAULT_POS, norm_plan_tier, save_widget_cfg
+from monitor.config import (
+    DEFAULT_ACTIVE_PLATFORM, PLATFORMS, WIDGET_DEFAULT_POS,
+    norm_active_platform, norm_plan_tier, save_widget_cfg,
+)
 
 _log = logging.getLogger("agent_monitor")
 
@@ -29,6 +32,8 @@ class _TrayState:
         self.refresh_wake = threading.Event()
         self.refresh_lock = threading.Lock()
         self.pipe_lock = threading.Lock()    # Pipe.send 的跨线程互斥
+        # 平台切换、缓存替换和 revision 快照共用一把锁；刷新线程不在锁内做扫描。
+        self.platform_lock = threading.RLock()
         self.interval_secs = 300
         self.child_exiting = False
         self.widget_pinned = False
@@ -42,6 +47,13 @@ class _TrayState:
         self.widget_pos = list(WIDGET_DEFAULT_POS)
         self.widget_plan_tier = "lite"       # 贴纸档位（lite|pro|max，贴纸批次 2 新增）
         self.widget_used = False             # 用户是否启用过贴纸（首次默认开）
+        self.active_platform = DEFAULT_ACTIVE_PLATFORM
+        self.platform_revision = 0
+        self.platform_cache: Dict[str, Any] = {platform: None for platform in PLATFORMS}
+        self.pending_task_id = None
+        self.continuation_pending = False
+        self.continuation_signature = None
+        self.continuation_due = 0.0
 
 
 TRAY = _TrayState()
@@ -49,32 +61,49 @@ TRAY = _TrayState()
 
 def apply_widget_cfg(cfg: Dict[str, Any]) -> None:
     """把载入的贴纸配置字典应用到托盘状态（启动时与 widget.json 同步）。"""
-    TRAY.widget_visible = bool(cfg.get("visible", True))
-    TRAY.widget_passthrough = bool(cfg.get("passthrough", False))
-    TRAY.widget_pinned = bool(cfg.get("pinned", False))
-    TRAY.widget_opacity = float(cfg.get("opacity", 0.75))
-    TRAY.widget_pos = [int(cfg.get("x", WIDGET_DEFAULT_POS[0])),
-                       int(cfg.get("y", WIDGET_DEFAULT_POS[1]))]
-    TRAY.widget_plan_tier = norm_plan_tier(cfg.get("plan_tier"))
+    with TRAY.platform_lock:
+        TRAY.widget_visible = bool(cfg.get("visible", True))
+        TRAY.widget_passthrough = bool(cfg.get("passthrough", False))
+        TRAY.widget_pinned = bool(cfg.get("pinned", False))
+        TRAY.widget_opacity = float(cfg.get("opacity", 0.75))
+        TRAY.widget_pos = [int(cfg.get("x", WIDGET_DEFAULT_POS[0])),
+                           int(cfg.get("y", WIDGET_DEFAULT_POS[1]))]
+        TRAY.widget_plan_tier = norm_plan_tier(cfg.get("plan_tier"))
+        TRAY.active_platform = norm_active_platform(cfg.get("active_platform"))
 
 
-def _persist_widget_cfg() -> None:
+def _persist_widget_cfg(active_platform: Any = None) -> bool:
     """把当前托盘贴纸状态持久化到 widget.json（经由 monitor.config 原子写）。
 
     批次 2 起携带 plan_tier：任何贴纸配置保存路径（位置回传/显隐/穿透/透明度）
     都会带上当前档位，保证切档位后不被后续保存覆盖丢失。
     （pinned 缺失为 v1 已知缺陷，本批次按授权保持原样。）
     """
-    if not save_widget_cfg({
-        "visible": TRAY.widget_visible,
-        "passthrough": TRAY.widget_passthrough,
-        "pinned": TRAY.widget_pinned,
-        "opacity": TRAY.widget_opacity,
-        "x": TRAY.widget_pos[0],
-        "y": TRAY.widget_pos[1],
-        "plan_tier": norm_plan_tier(TRAY.widget_plan_tier),
-    }):
-        _log.exception("widget.json 写入失败")
+    with TRAY.platform_lock:
+        platform = (TRAY.active_platform if active_platform is None
+                    else norm_active_platform(active_platform))
+        ok = save_widget_cfg({
+            "visible": TRAY.widget_visible,
+            "passthrough": TRAY.widget_passthrough,
+            "pinned": TRAY.widget_pinned,
+            "opacity": TRAY.widget_opacity,
+            "x": TRAY.widget_pos[0],
+            "y": TRAY.widget_pos[1],
+            "plan_tier": norm_plan_tier(TRAY.widget_plan_tier),
+            "active_platform": platform,
+        })
+    if not ok:
+        _log.error("widget.json 写入失败")
+    return ok
+
+
+def platform_state() -> Dict[str, Any]:
+    """返回可跨 Pipe 发送的平台快照，不暴露可变缓存对象。"""
+    with TRAY.platform_lock:
+        return {
+            "platform": TRAY.active_platform,
+            "revision": int(TRAY.platform_revision),
+        }
 
 
 # ---------- 托盘图标（PIL 运行时生成） ----------

@@ -1,0 +1,46 @@
+/* 双平台看板沿用 GAUGE 的碳黑与琥珀色；样式限定作用域，避免改变旧页。
+ * 颜色统一取 template.html 的 :root 令牌（--panel/--line/--tx/--tx2/--acc/--err），
+ * 不再引入游离色值，保证与主面板换肤/对比度同源。
+ */
+#gauge-platform{background:var(--panel);color:var(--tx);border:1px solid var(--acc);border-radius:4px;padding:7px 10px;font:inherit}
+#gauge-platform-status{font-size:12px;color:var(--tx2)}
+#codex-app{max-width:1280px;margin:0 auto;padding:0 16px 24px;color:var(--tx)}
+#codex-app[hidden]{display:none}
+.cx-toolbar,.cx-tabs{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.cx-toolbar{padding:12px 0;border-bottom:1px solid var(--line)}
+.cx-toolbar label{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--tx2)}
+.cx-toolbar select,.cx-toolbar input,.cx-button{background:var(--panel);color:var(--tx);border:1px solid var(--line);border-radius:4px;padding:7px 10px;font:inherit}
+.cx-toolbar input{min-width:200px}
+.cx-tabs{padding:12px 0}
+.cx-tabs button,.cx-button{cursor:pointer}
+.cx-tabs button[aria-selected=true]{color:var(--acc);border-color:var(--acc)}
+.cx-note{padding:10px 12px;margin:12px 0;background:var(--panel);border-left:3px solid var(--acc);color:var(--tx2);font-size:12px;line-height:1.7}
+.cx-note[data-error=true]{border-color:var(--err)}
+.cx-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0}
+.cx-card,.cx-panel{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:16px}
+.cx-card span{display:block;color:var(--tx2);font-size:12px}
+.cx-card strong{display:block;margin:9px 0;font:600 25px ui-monospace,Consolas,monospace}
+.cx-card small,.cx-muted{color:var(--tx2);font-size:12px}
+.cx-two{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}
+.cx-panel{margin:12px 0;overflow:hidden}
+.cx-panel h2{margin:0 0 14px;font-size:15px}
+.cx-table-wrap{overflow:auto}
+#codex-app table{width:100%;border-collapse:collapse;text-align:left;font-size:12px}
+#codex-app th,#codex-app td{padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top;max-width:420px;overflow-wrap:anywhere}
+#codex-app th{color:var(--tx2);font-weight:500;white-space:nowrap}
+.cx-task{border:0;background:none;color:var(--acc);font:inherit;text-align:left;padding:0;cursor:pointer}
+.cx-empty{padding:32px 16px;text-align:center;color:var(--tx2)}
+.cx-bar-row{display:grid;grid-template-columns:minmax(90px,1fr) 2fr 90px;gap:10px;align-items:center;margin:12px 0;font-size:12px}
+.cx-bar-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cx-bar-track{height:6px;background:var(--line)}.cx-bar-fill{height:6px;background:var(--acc)}
+.cx-quota{height:7px;background:var(--line);margin:10px 0;overflow:hidden}.cx-quota span{display:block;background:var(--acc);height:100%}
+.cx-chart{width:100%;height:170px;display:block}.cx-chart-labels{display:flex;justify-content:space-between;color:var(--tx2);font-size:11px}
+.cx-details{border-top:1px solid var(--line);margin-top:20px;padding-top:16px}.cx-details h2{font-size:17px;overflow-wrap:anywhere}
+.cx-pager{display:flex;gap:10px;justify-content:flex-end;align-items:center;margin-top:12px;color:var(--tx2);font-size:12px}
+.cx-tree details{margin:8px 0 8px 14px;border-left:1px solid var(--line);padding-left:10px}.cx-tree summary{cursor:pointer;font-size:13px;padding:5px 0}
+.cx-tree .cx-leaf{padding:8px 0 8px 24px;font-size:12px}
+.cx-tree small{margin-left:8px;color:var(--tx2)}
+.cx-key-values{display:grid;grid-template-columns:minmax(100px,180px) 1fr;gap:9px;font-size:12px;overflow-wrap:anywhere}
+.cx-key-values dt{color:var(--tx2)}.cx-key-values dd{margin:0;white-space:pre-wrap}
+@media(max-width:960px){.cx-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.cx-two{grid-template-columns:1fr}.cx-toolbar input{min-width:140px}}
+@media(max-width:540px){.cx-grid{grid-template-columns:1fr 1fr}.cx-card{padding:10px}.cx-card strong{font-size:20px}}

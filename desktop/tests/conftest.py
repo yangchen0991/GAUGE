@@ -9,3 +9,13 @@ from pathlib import Path
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[1]))
 sys.path.insert(0, str(_HERE.parents[2]))
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_codex_source(tmp_path, monkeypatch):
+    """回归测试不得扫描使用者的会话或写入真实统计缓存。"""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("CODEX_SQLITE_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("GAUGE_DATA_DIR", str(tmp_path / "gauge-cache"))
