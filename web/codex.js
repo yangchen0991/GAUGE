@@ -1,6 +1,7 @@
 /* GAUGE Codex 看板：只消费白名单统计快照，不访问源数据库或认证文件。
  * 平台选择在桌面由主进程决定；独立 HTML 才使用 localStorage 保存偏好。
  * 过滤与任务子树统计都以单次用量记录的 thread_id 为归属，累计字段不参与相加。
+ * 项目列表按范围内选中集聚合；项目详情与任务详情一致，消费全量已读取历史。
  */
 (function () {
   'use strict';
@@ -18,6 +19,7 @@
     children.add(edge.child_id);
     childrenById.set(edge.parent_id, children);
   });
+  var projectById = new Map((snapshot.projects || []).map(function (project) { return [project.id, project]; }));
 
   function readPreference(key, fallback) {
     try { return JSON.parse(localStorage.getItem(key)) || fallback; }
@@ -54,7 +56,9 @@
   }
   function bridge() { return window.pywebview && window.pywebview.api; }
 
-  var allowedTabs = ['overview', 'usage', 'tasks', 'agents', 'tools', 'environment'];
+  var allowedTabs = ['overview', 'usage', 'projects', 'tasks', 'agents', 'tools', 'environment'];
+  // 未归属桶在 view.projectId 里需要独立编码：空字符串表示“未打开详情”，桶与关闭态不能共用值。
+  var UNASSIGNED_KEY = '__unassigned__';
   var saved = readPreference('gauge.codex.view.v1', {});
   var view = {
     tab: allowedTabs.includes(saved.tab) ? saved.tab : 'overview',
@@ -62,6 +66,7 @@
     project: typeof saved.project === 'string' ? saved.project : '',
     model: typeof saved.model === 'string' ? saved.model : '',
     query: typeof saved.query === 'string' ? saved.query : '',
+    projectId: typeof saved.projectId === 'string' ? saved.projectId : '',
     page: 0, taskId: typeof saved.taskId === 'string' ? saved.taskId : ''
   };
   var activePlatform = 'zcode';
@@ -275,6 +280,66 @@
       '<div class="cx-note">用量只统计已读取、可去重的响应。缓存包含在输入内，推理包含在输出内。线程记录的累计值不与响应再次相加；订阅用量不换算为现金账单。</div>';
   }
 
+  // 项目页签：列表聚合范围内选中集（与总览筛选同源）；详情与任务详情一致，消费全量已读取历史。
+  // 未归属桶 = 没有项目记录且工作目录未匹配的线程；线程记录缺失的用量也并入该桶（与总览排行口径一致）。
+  function projectKeyOf(thread) { return thread && thread.project_id ? thread.project_id : UNASSIGNED_KEY; }
+  function projectMembers(id) {
+    return threads.filter(function (thread) {
+      return id === UNASSIGNED_KEY ? !thread.project_id : thread.project_id === id;
+    });
+  }
+  function projectsPage(selected) {
+    var counts = new Map(), tokens = new Map(), lastSeen = new Map();
+    selected.threads.forEach(function (thread) {
+      var key = projectKeyOf(thread);
+      counts.set(key, (counts.get(key) || 0) + 1);
+      lastSeen.set(key, Math.max(lastSeen.get(key) || 0, numeric(thread.updated_at)));
+    });
+    selected.usage.forEach(function (record) {
+      var key = projectKeyOf(threadById.get(record.thread_id));
+      tokens.set(key, (tokens.get(key) || 0) + numeric(record.total_tokens));
+    });
+    var rows = (snapshot.projects || []).map(function (project) { return { id: project.id, name: project.name || project.id }; });
+    var seen = new Set();
+    rows = rows.filter(function (row) { if (seen.has(row.id)) return false; seen.add(row.id); return true; });
+    if (counts.has(UNASSIGNED_KEY) || tokens.has(UNASSIGNED_KEY)) rows.push({ id: UNASSIGNED_KEY, name: '未归属' });
+    rows.forEach(function (row) {
+      row.count = counts.get(row.id) || 0;
+      row.tokens = tokens.get(row.id) || 0;
+      row.last = lastSeen.get(row.id) || 0;
+    });
+    // Token 降序；未归属桶恒排最末，避免长期大桶压顶盖住真实项目。
+    rows.sort(function (a, b) { return b.tokens - a.tokens; });
+    rows = rows.filter(function (row) { return row.id !== UNASSIGNED_KEY; })
+      .concat(rows.filter(function (row) { return row.id === UNASSIGNED_KEY; }));
+    var list = rows.length ? panel('项目 · ' + rows.length + ' 个', table(['项目', '任务数（范围内）', 'Token（范围内）', '最近活动'], rows.map(function (row) {
+      var button = '<button class="cx-task" data-project="' + escapeHtml(row.id) + '">' + escapeHtml(row.name) + '</button>';
+      return [button, formatNumber(row.count), formatNumber(row.tokens), escapeHtml(formatTime(row.last))];
+    }))) : panel('项目', '<div class="cx-empty">当前范围没有可展示的项目记录</div>');
+    return list + (view.projectId ? projectDetail(view.projectId) : '<p class="cx-muted">点击项目名称查看项目详情：根目录、关联任务与用量构成。</p>');
+  }
+  function projectDetail(id) {
+    var unassigned = id === UNASSIGNED_KEY;
+    var record = unassigned ? null : projectById.get(id);
+    var members = projectMembers(id);
+    var memberIds = new Set(members.map(function (thread) { return thread.id; }));
+    var own = usage.filter(function (item) { return memberIds.has(item.thread_id); });
+    var sums = new Map(), last = 0;
+    own.forEach(function (item) { sums.set(item.thread_id, (sums.get(item.thread_id) || 0) + numeric(item.total_tokens)); });
+    members.forEach(function (thread) { last = Math.max(last, numeric(thread.updated_at)); });
+    var roots = record && Array.isArray(record.roots) && record.roots.length ? record.roots.join('、') : '—';
+    var sorted = members.slice().sort(function (a, b) { return numeric(b.updated_at) - numeric(a.updated_at); });
+    return '<div class="cx-details"><h2>' + escapeHtml(unassigned ? '未归属' : (record && record.name) || id) + '</h2>' + 
+      '<p class="cx-muted">' + escapeHtml(unassigned ? '没有项目记录且工作目录未匹配的任务' : id) + '</p>' +
+      cards([['已读取 Token', total(own, 'total_tokens'), '全部已读取历史，不随时间筛选变化'], ['关联任务', members.length, '含子 Agent 任务'], ['最近活动', members.length ? formatTime(last) : '—', '文件侧口径，不代表正在运行']]) +
+      panel('项目信息', keyValues({ '项目 ID': unassigned ? '—' : id, '根目录': roots })) +
+      '<div class="cx-two">' + panel('模型构成', rankings(own, function (item) { return item.model; })) + panel('每日 Token', trend(own)) + '</div>' +
+      panel('关联任务 · ' + members.length + ' 条', table(['任务', '归属来源', '模型', '历史状态', '已读取 Token', '最后更新'], sorted.map(function (thread) {
+        var source = thread.project_inferred ? '目录推断' : (thread.project_id ? '项目记录' : '未归属');
+        return [taskButton(thread), escapeHtml(source), escapeHtml(thread.model || '未记录'), escapeHtml(statusLabel(thread.status)), formatNumber(sums.get(thread.id) || 0), escapeHtml(formatTime(thread.updated_at))];
+      }))) + '</div>';
+  }
+
   // 子树只用集合求闭包，防止重复边或损坏的环造成重复累计和无限递归。
   function descendants(id) {
     var visited = new Set(); var queue = [id];
@@ -371,12 +436,16 @@
     // 来源目录变更或模型记录消失时，移除旧筛选，避免界面显示“全部”却仍按旧值过滤。
     if (view.project && !projects.some(function (item) { return item[0] === view.project; })) view.project = '';
     if (view.model && !models.some(function (item) { return item[0] === view.model; })) view.model = '';
+    // 项目详情指向的项目消失（来源变化）时清除选择，避免打开一个不存在的“幽灵项目”。
+    if (view.projectId === UNASSIGNED_KEY) {
+      if (!threads.some(function (thread) { return !thread.project_id; })) view.projectId = '';
+    } else if (view.projectId && !projectById.has(view.projectId)) view.projectId = '';
     savePreference('gauge.codex.view.v1', view);
     var selected = selection();
-    var labels = ['总览', '用量分析', '任务', 'Agent 协作', '工具与异常', '数据与环境'];
+    var labels = ['总览', '用量分析', '项目', '任务', 'Agent 协作', '工具与异常', '数据与环境'];
     var coverage = snapshot.coverage || {};
     var warnings = (snapshot.warnings || []).slice(0, 3).map(escapeHtml).join('；');
-    var page = { overview: overview, usage: usagePage, tasks: tasksPage, agents: agentsPage, tools: toolsPage, environment: environmentPage }[view.tab];
+    var page = { overview: overview, usage: usagePage, projects: projectsPage, tasks: tasksPage, agents: agentsPage, tools: toolsPage, environment: environmentPage }[view.tab];
     app.innerHTML = '<div class="cx-toolbar"><label>时间<select data-filter="days" aria-label="时间">' + ['7', '14', '30', 'all'].map(function (days) { return '<option value="' + days + '" ' + (view.days === days ? 'selected' : '') + '>' + (days === 'all' ? '全部' : '近' + days + '天') + '</option>'; }).join('') + '</select></label><label>项目<select data-filter="project" aria-label="项目">' + options(projects, view.project, '全部项目') + '</select></label><label>模型<select data-filter="model" aria-label="模型">' + options(models, view.model, '全部模型') + '</select></label><input data-filter="query" aria-label="搜索任务" placeholder="任务标题或工作目录" value="' + escapeHtml(view.query) + '"><button class="cx-button" data-refresh>刷新</button><span class="cx-muted">更新于 ' + escapeHtml(snapshot.generated_at || '尚未读取') + '</span></div>' +
       '<div class="cx-tabs" role="tablist">' + allowedTabs.map(function (tab, index) { return '<button class="cx-button" role="tab" aria-selected="' + (view.tab === tab) + '" data-tab="' + tab + '">' + labels[index] + '</button>'; }).join('') + '</div>' +
       '<div class="cx-note" data-error="' + (snapshot.status === 'error' || snapshot.status === 'unavailable') + '">' +
@@ -392,6 +461,11 @@
     var target = event.target.closest('button'); if (!target) return;
     if (target.hasAttribute('data-tab')) { view.tab = target.getAttribute('data-tab'); render(); }
     else if (target.hasAttribute('data-task')) { view.tab = 'tasks'; view.taskId = target.getAttribute('data-task'); render(); }
+    else if (target.hasAttribute('data-project')) {
+      var chosen = target.getAttribute('data-project');
+      view.projectId = view.projectId === chosen ? '' : chosen; // 再次点击已选项目 = 收回详情
+      render();
+    }
     else if (target.hasAttribute('data-page')) { view.page += Number(target.getAttribute('data-page')); render(); }
     else if (target.hasAttribute('data-refresh')) {
       var api = bridge();

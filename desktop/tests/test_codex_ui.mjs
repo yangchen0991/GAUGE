@@ -111,4 +111,35 @@ assert.equal(desktop.select.disabled, true);
 desktop.window.gaugeApplyPlatform({ platform: 'codex', revision: 1 });
 assert.equal(desktop.app.hidden, false);
 assert.equal(desktop.select.disabled, false);
+
+// 项目页签：空 projects 快照下应出现「未归属」桶；点击展开详情并可跳任务详情。
+ui.tab('projects');
+assert.ok(ui.app.innerHTML.includes('data-tab="projects"'));
+assert.ok(ui.app.innerHTML.includes('未归属'));
+assert.ok(ui.app.innerHTML.includes('当前范围没有可展示的项目记录') === false);
+function openProject(id) {
+  ui.app.listeners.click({ target: { closest: () => ({
+    hasAttribute: key => key === 'data-project', getAttribute: () => id
+  }) } });
+}
+openProject('__unassigned__');
+assert.ok(ui.app.innerHTML.includes('关联任务'));
+assert.ok(ui.app.innerHTML.includes('未归属'));
+assert.ok(ui.app.innerHTML.includes('目录推断') === false); // 无 project_id 的线程不足“未归属”文案外另一层
+assert.match(ui.app.innerHTML, /已读取 Token<\/span><strong>690<\/strong>/);
+// 详情里的任务按钮跳任务页签并打开回合时间线。
+function clickTask(id) {
+  ui.app.listeners.click({ target: { closest: () => ({
+    hasAttribute: key => key === 'data-task', getAttribute: () => id
+  }) } });
+}
+clickTask('parent');
+assert.ok(ui.app.innerHTML.includes('回合时间线'));
+// 回到项目页：任务跳转不清除项目选择，详情仍展开；再次点击同一项目收回（toggle）。
+ui.tab('projects');
+openProject('__unassigned__');
+assert.ok(!ui.app.innerHTML.includes('关联任务 · 2 条'));
+// 再点一次重新展开。
+openProject('__unassigned__');
+assert.ok(ui.app.innerHTML.includes('关联任务 · 2 条'));
 console.log('Codex 页面交互与统计边界：通过');
