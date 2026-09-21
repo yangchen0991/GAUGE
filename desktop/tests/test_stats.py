@@ -142,8 +142,8 @@ class TestPeakFactor:
     """
 
     @staticmethod
-    def _ms(*args: int) -> int:
-        return int(datetime(*args).timestamp() * 1000)
+    def _ms(y: int, m: int, d: int, h: int = 0, mi: int = 0, s: int = 0) -> int:
+        return int(datetime(y, m, d, h, mi, s).timestamp() * 1000)
 
     def test_boundaries(self):
         assert stats.peak_factor(self._ms(2024, 1, 15, 13, 59)) == 0.5   # 周一 13:59

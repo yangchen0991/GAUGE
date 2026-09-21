@@ -157,7 +157,8 @@ def platform_tooltip(data: Dict[str, Any], platform: str) -> str:
         return tooltip_text()
     if data.get("status") in ("error", "unavailable"):
         return "Codex · 数据不可用"
-    today = data.get("today") if isinstance(data.get("today"), dict) else {}
+    raw_today = data.get("today")
+    today = raw_today if isinstance(raw_today, dict) else {}
     requests = today.get("requests")
     total = today.get("total")
     parts = ["Codex"]
@@ -181,7 +182,7 @@ def _schedule_continuation(data: Optional[Dict[str, Any]]) -> None:
             TRAY.continuation_due = 0.0
             TRAY.continuation_signature = None
             return
-        pending = coverage.get("pending_bytes")
+        pending = coverage.get("pending_bytes") or 0
         complete = coverage.get("complete") is True
         try:
             pending = int(pending)

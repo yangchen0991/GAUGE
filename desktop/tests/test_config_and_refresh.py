@@ -200,7 +200,9 @@ class TestRefreshSidecar:
         mu = ("INSERT INTO model_usage (session_id,provider_id,model_id,agent,status,"
               "started_at,duration_ms,finish_reason,input_tokens,output_tokens,"
               "cache_read_input_tokens,error_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
-        rows = [
+        # finish_reason 与 error_type 在库内均可为 NULL，按真实表结构声明
+        rows: list[tuple[str, str, str, str, str, int, int, "str | None",
+                         int, int, int, "str | None"]] = [
             # 昨日 10:00：GLM-5.3 正常（不进 today，进 week 的昨日桶）
             ("s1", "prov", "GLM-5.3", "ag", "completed", yesterday(10), 100, "stop",
              500_000, 50_000, 0, None),

@@ -26,7 +26,7 @@ def _write_lines(path: Path, events: list[dict], *, trailing_newline: bool = Tru
 
 
 def _usage_event(response_id: str, thread_id: str, turn_id: str, *, input_tokens: int, cached: int, output: int, reasoning: int = 0, timestamp: int | None = None) -> dict:
-    payload = {
+    payload: dict[str, object] = {  # 字段类型混杂，显式放宽以便按需写入 timestamp_ms
         "thread_id": thread_id,
         "turn_id": turn_id,
         "response_id": response_id,

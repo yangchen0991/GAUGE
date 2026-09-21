@@ -787,6 +787,7 @@ def _window_cmd_loop(state: "_WindowState", pipe: Any) -> None:
                     or not isinstance(revision, int) or revision < 0):
                 log("[win] 忽略非法 PLATFORM_STATE：%r" % (payload,))
                 continue
+            assert isinstance(platform, str)  # is_valid_platform 已保证为字符串，仅供 mypy 收窄
             with state.platform_lock:
                 if revision < state.platform_revision:
                     log("[win] 丢弃旧平台 revision：%r" % (payload,))
@@ -943,6 +944,7 @@ def window_process_main(pipe: Any, widget_cfg: Optional[Dict[str, Any]] = None) 
         state.cfg.update(widget_cfg)
         active_platform = widget_cfg.get("active_platform")
         if is_valid_platform(active_platform):
+            assert isinstance(active_platform, str)  # is_valid_platform 已保证为字符串，仅供 mypy 收窄
             state.active_platform = active_platform
 
     try:

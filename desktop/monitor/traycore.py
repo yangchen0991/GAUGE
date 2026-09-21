@@ -9,7 +9,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from monitor.appenv import ICO_PATH, NOTIFY_MAX, log
 from monitor.config import (
@@ -52,7 +52,7 @@ class _TrayState:
         self.platform_cache: Dict[str, Any] = {platform: None for platform in PLATFORMS}
         self.pending_task_id = None
         self.continuation_pending = False
-        self.continuation_signature = None
+        self.continuation_signature: Optional[Tuple[int, Any, Any]] = None  # 续读签名（pending, 已处理数, 总数）
         self.continuation_due = 0.0
 
 

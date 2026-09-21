@@ -79,12 +79,14 @@ def test_load_sidecar_selects_bundle_and_old_format_is_zcode_only(tmp_path: Path
     monkeypatch.setattr(refreshctl, "SIDECAR_PATH", path)
     zcode = refreshctl.load_sidecar("zcode")
     codex = refreshctl.load_sidecar("codex")
+    assert zcode is not None and codex is not None
     assert zcode["platform"] == "zcode" and zcode["today"]["requests"] == 2
     assert codex["platform"] == "codex" and codex["today"]["total"] == 99
 
     path.write_text(json.dumps({"today": {"requests": 4}}), encoding="utf-8")
     old = refreshctl.load_sidecar("zcode")
     missing_codex = refreshctl.load_sidecar("codex")
+    assert old is not None and missing_codex is not None
     assert old["platform"] == "zcode"
     assert missing_codex["platform"] == "codex"
     assert missing_codex["status"] == "unavailable"
@@ -110,12 +112,13 @@ def test_push_current_platform_attaches_revision_and_order(tmp_path: Path, monke
         },
     }), encoding="utf-8")
     monkeypatch.setattr(refreshctl, "SIDECAR_PATH", path)
-    messages = []
+    messages: list[tuple[str, dict]] = []
     monkeypatch.setattr(refreshctl, "child_send", messages.append)
     with TRAY.platform_lock:
         TRAY.active_platform = "codex"
         TRAY.platform_revision = 4
     payload = refreshctl.push_current_platform(force=True)
+    assert payload is not None
     assert payload["platform"] == "codex" and payload["platform_revision"] == 4
     assert messages[0] == ("PLATFORM_STATE", {"platform": "codex", "revision": 4})
     assert messages[1][0] == "WIDGET_DATA"
