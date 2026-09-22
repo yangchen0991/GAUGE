@@ -59,6 +59,13 @@ DB_PATH = os.environ.get("AGENT_MONITOR_DB") or os.path.expanduser("~/.zcode/cli
 DB_DISPLAY = DB_PATH + "（只读导出）"
 PLACEHOLDER = "/*__DATA_PLACEHOLDER__*/null"
 
+# node --check 子进程的 Windows 创建旗标（导入期用真实 subprocess 解析一次）。
+# 冻结 exe 为 GUI 子系统、无控制台父进程，Windows 会为 node（控制台子系统）
+# 子进程分配新控制台窗口——真机每次刷新黑窗闪现的根因。capture_output 已通
+# 过管道接管输出，无窗口不影响采集；非 Windows 传 0 即无任何创建旗标，行为
+# 与原先完全一致。
+_NODE_CHECK_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 # ---- 显示名映射（唯一权威定义；template.html 已无回退映射、直接消费 DATA 里的
 # label，原始 id 仍始终保留在 DATA.agents[].id / providers[].id 中）----
 AGENT_LABELS = {
@@ -205,7 +212,10 @@ def node_syntax_check(html_text, check_path=None):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(code)
-            r = subprocess.run([node, "--check", tmp], capture_output=True, text=True)
+            # 旗标在模块级用真实 subprocess 解析（见 _NODE_CHECK_CREATIONFLAGS），
+            # 子进程静默不闪控制台窗口。
+            r = subprocess.run([node, "--check", tmp], capture_output=True,
+                               text=True, creationflags=_NODE_CHECK_CREATIONFLAGS)
             if r.returncode != 0:
                 die("JS 语法检查失败（script #%d，node --check）：\n%s" % (i, (r.stderr or r.stdout)[:2000]))
         finally:

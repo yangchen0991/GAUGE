@@ -347,3 +347,43 @@ class TestRunRefreshNoWindow:
         assert kw["timeout"] == refreshctl.REFRESH_TIMEOUT
         assert kw["env"]["PYTHONIOENCODING"] == "utf-8"
         assert captured["args"][0] == [sys.executable, str(refreshctl.REFRESH_PY)]
+
+
+# ---------- 回归锁：node --check 子进程在冻结 exe 下不得闪现控制台黑窗 ----------
+class TestNodeSyntaxCheckNoWindow:
+    """真机反馈：冻结 exe（GUI 子系统、无控制台父进程）的内联刷新管线里
+    node_syntax_check 直接 subprocess.run node --check，Windows 会为 node
+    （控制台子系统）子进程分配新控制台窗口——每次刷新黑窗闪现的第二个
+    根因。契约：node 子进程在 Windows 下必须携带 CREATE_NO_WINDOW，且
+    node 命令/临时输入文件原样传递、capture_output 管道采集不变。stub 掉
+    shutil.which 与 subprocess.run，不依赖本机真实 node。非 Windows 跳过。
+    """
+
+    def test_node_check_passes_create_no_window(self, tmp_path, monkeypatch):
+        import os
+        import subprocess
+
+        import refresh
+
+        if os.name != "nt":
+            pytest.skip("CREATE_NO_WINDOW 为 Windows 专有旗标，仅 Windows 平台验证")
+        captured: dict = {}
+
+        def _fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            # 最小 stub：退出码 0，让校验路径正常走通
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(refresh.shutil, "which", lambda name: "node-stub.exe")
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        html = "<html><body><script>var x = 1;</script></body></html>"
+        check_path = str(tmp_path / "out.nodecheck")
+        assert refresh.node_syntax_check(html, check_path=check_path) is True
+        kw = captured["kwargs"]
+        # 核心：Windows 下 creationflags 必须含 CREATE_NO_WINDOW（漏传即红）
+        assert kw["creationflags"] & subprocess.CREATE_NO_WINDOW
+        # node 命令与临时输入 js 文件原样传递；输出仍经管道采集
+        assert captured["args"][:2] == ["node-stub.exe", "--check"]
+        assert str(captured["args"][2]).endswith(".js")
+        assert kw["capture_output"] is True and kw["text"] is True

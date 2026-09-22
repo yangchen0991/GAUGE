@@ -163,3 +163,48 @@ def test_platform_bridge_rejects_invalid_and_limits_task_to_codex(monkeypatch, t
     state.active_platform = "codex"
     assert widget_api.open_task("thread-1")
     assert sent == [["SET_PLATFORM", "codex"], ["OPEN_TASK", "codex", "thread-1"]]
+
+
+def test_continuation_chain_caps_after_three_rounds_then_resets(tray_state):
+    """无限续读链收敛上限：Codex 活跃写入时 rollout 持续增长、签名每轮都有
+    进展，曾导致每 ~11 秒连轴续读、架空 300 秒正常间隔。契约：签名每次
+    进展的续读最多排队 3 轮，之后不再调度（回落正常刷新间隔）；complete
+    coverage 驱动一次即清零轮数。continuation_rounds 不在既有 fixture 快照
+    集内，按该 fixture 手法在本测试内快照/恢复。
+    """
+    with TRAY.platform_lock:
+        saved_rounds = TRAY.continuation_rounds
+    TRAY.refresh_wake.clear()
+    TRAY.active_platform = "codex"
+    with TRAY.platform_lock:
+        TRAY.continuation_rounds = 0
+    try:
+        for round_no in range(1, 4):
+            refreshctl._schedule_continuation({"coverage": {
+                "pending_bytes": 100 - round_no * 10, "processed_files": round_no,
+                "total_files": 9, "complete": False,
+            }})
+            assert TRAY.continuation_pending is True      # 前 3 轮照常排队追帧
+            assert TRAY.continuation_rounds == round_no   # 轮数递增至 3
+            TRAY.refresh_wake.clear()
+        # 第 4 次（签名仍有进展）已达上限：不再调度，回落正常刷新间隔
+        refreshctl._schedule_continuation({"coverage": {
+            "pending_bytes": 50, "processed_files": 4, "total_files": 9,
+            "complete": False,
+        }})
+        assert TRAY.continuation_pending is False
+        assert TRAY.continuation_due == 0.0
+        assert TRAY.continuation_signature is None
+        assert not TRAY.refresh_wake.is_set()             # 未再次唤醒续读
+        assert TRAY.continuation_rounds == 3              # 达上限后不再递增
+        # complete coverage：清 pending/due/signature 的同时轮数清零
+        refreshctl._schedule_continuation({"coverage": {
+            "pending_bytes": 0, "processed_files": 9, "total_files": 9,
+            "complete": True,
+        }})
+        assert TRAY.continuation_pending is False
+        assert TRAY.continuation_rounds == 0
+    finally:
+        with TRAY.platform_lock:
+            TRAY.continuation_rounds = saved_rounds
+        TRAY.refresh_wake.clear()

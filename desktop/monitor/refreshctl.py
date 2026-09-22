@@ -26,6 +26,11 @@ from monitor.traycore import TRAY, child_send, notify_user, platform_state
 
 _log = logging.getLogger("agent_monitor")
 
+# 连续续读上限：Codex 活跃使用时 rollout 持续增长、签名每轮都有进展，曾导致
+# 每 ~11 秒一次的无限续读链（架空 300 秒正常间隔，真机日志证实）。达到上限后
+# 不再排队短间隔续读，回落正常刷新间隔，剩余 pending 由后续常规周期消化。
+_CONTINUATION_MAX_ROUNDS = 3
+
 
 def _unavailable_widget(platform: str, detail: str) -> Dict[str, Any]:
     """为缺失的平台数据生成明确错误包；绝不以另一平台数据冒充。"""
@@ -190,16 +195,26 @@ def _schedule_continuation(data: Optional[Dict[str, Any]]) -> None:
             pending = 0
         signature = (pending, coverage.get("processed_files"), coverage.get("total_files"))
         if pending > 0 and not complete:
+            if TRAY.continuation_rounds >= _CONTINUATION_MAX_ROUNDS:
+                # 连续续读上限已达：清 pending/due/signature，回落到正常刷新
+                # 间隔，防止 Codex 活跃写入（rollout 持续增长）造成的无限续读
+                # 链。已捕捉的进展不丢，剩余 pending 等下个常规周期消化。
+                TRAY.continuation_pending = False
+                TRAY.continuation_due = 0.0
+                TRAY.continuation_signature = None
+                return
             progressed = signature != TRAY.continuation_signature
             TRAY.continuation_signature = signature
             if progressed:
                 TRAY.continuation_pending = True
                 TRAY.continuation_due = time.monotonic() + 7.0
+                TRAY.continuation_rounds += 1
                 TRAY.refresh_wake.set()
         else:
             TRAY.continuation_pending = False
             TRAY.continuation_due = 0.0
             TRAY.continuation_signature = None
+            TRAY.continuation_rounds = 0
 
 
 def _run_refresh_inline() -> Tuple[bool, str]:
@@ -311,6 +326,11 @@ def refresh_once(reason: str) -> None:
         return
     try:
         t0 = time.monotonic()
+        if reason != "codex-continuation":
+            # 常规/手动刷新执行即复位续读轮数：上限只约束一次常规刷新之后的
+            # 连续追帧，新一轮常规刷新重新获得完整续读预算。
+            with TRAY.platform_lock:
+                TRAY.continuation_rounds = 0
         _notify_widget_refresh_state("refreshing")
         ok, detail = run_refresh()
         elapsed = time.monotonic() - t0

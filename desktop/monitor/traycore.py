@@ -54,6 +54,7 @@ class _TrayState:
         self.continuation_pending = False
         self.continuation_signature: Optional[Tuple[int, Any, Any]] = None  # 续读签名（pending, 已处理数, 总数）
         self.continuation_due = 0.0
+        self.continuation_rounds = 0         # 连续续读轮数（上限见 refreshctl._CONTINUATION_MAX_ROUNDS）
 
 
 TRAY = _TrayState()
