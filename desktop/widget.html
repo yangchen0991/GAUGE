@@ -210,12 +210,71 @@ body.wx-expanded #week{height:auto;min-height:120px;flex:1}
 }
 .platform-seg{display:flex;gap:3px;margin-left:auto}
 .platform-opt{min-width:54px}
+/* —— Codex 模式多尺寸布局（网格功能主义：列宽由内容与视口共同决定，禁止空列占位） —— */
 .codex-only{display:none}
 body.codex-mode .codex-only{display:block}
 body.codex-mode .col-left .card{display:none}
 body.codex-mode #seg-unit{visibility:hidden;pointer-events:none}
+/* compact（窄幅）：Codex 不需要双列；隐藏列容器本身而非仅隐藏卡片，
+   避免 display:contents 双列语义下右列仍被左列宽度挤压。 */
+body.codex-mode main{flex-direction:column;overflow:hidden}
+body.codex-mode .col-left{display:none}
+body.codex-mode .col-right{display:flex;flex-direction:column;min-height:0;flex:1;width:auto}
+body.codex-mode .chartblock{flex:none;min-height:84px}
+body.codex-mode #week{height:clamp(72px,16vh,104px);min-height:72px;flex:none}
+body.codex-mode .card.codex-only{
+  display:flex;flex-direction:column;min-height:0;flex:1;
+  padding-top:8px;overflow:auto;scrollbar-width:thin;
+}
+body.codex-mode .task-list{flex:1;min-height:44px;overflow:auto;scrollbar-width:thin}
+body.codex-mode .task-list .task-item{flex:none}
+/* wide（展开）：Codex 单列全宽，图表与任务卡按网格 5:7 分行；
+   ZCode 的 48%/52% 双列仅对非 codex 生效，空列不再占位。 */
+body.codex-mode.wx-expanded main{flex-direction:column;gap:8px;overflow:hidden}
+body.codex-mode.wx-expanded .col-left{display:none}
+body.codex-mode.wx-expanded .col-right{
+  display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);
+  grid-template-rows:minmax(0,auto) minmax(0,1fr);
+  gap:8px;min-height:0;flex:1;width:auto;overflow:hidden;
+}
+body.codex-mode.wx-expanded .chartblock{min-height:0;grid-row:1}
+body.codex-mode.wx-expanded #week{height:auto;min-height:96px;flex:1}
+body.codex-mode.wx-expanded .card.codex-only{
+  display:flex;flex-direction:column;flex:none;min-height:0;
+  grid-row:1/3;grid-column:2;overflow:auto;scrollbar-width:thin;
+}
+/* 超宽（≥980px）：右列网格升为三列，图表独占一行顶部，任务卡全宽在下方长列表。 */
+@media (min-width:980px){
+  body.codex-mode.wx-expanded .col-right{
+    grid-template-columns:minmax(0,4fr) minmax(0,4fr) minmax(0,4fr);
+    grid-template-rows:minmax(0,5fr) minmax(0,7fr);
+  }
+  body.codex-mode.wx-expanded .chartblock{grid-column:1/4;min-height:0}
+  body.codex-mode.wx-expanded .card.codex-only{
+    display:flex;flex-direction:column;flex:none;min-height:0;
+    grid-column:2/4;grid-row:2;overflow:auto;scrollbar-width:thin;
+  }
+}
+/* 超扁（高≤340px）：压缩图表下限，Codex 卡片信息区改为可折叠降级，
+   任务列表保留最小可读高度；quota 行在极矮时隐藏重置时间保数字。 */
+@media (max-height:340px){
+  body.codex-mode #week{height:clamp(56px,14vh,80px);min-height:56px}
+  body.codex-mode.wx-expanded #week{min-height:72px}
+  body.codex-mode .chartblock{min-height:70px}
+  body.codex-mode .codex-summary{display:none}
+  body.codex-mode .token-grid{gap:3px 8px;margin-top:4px}
+  body.codex-mode .quota-line span:last-child{display:none}
+}
+/* 矮视口（高≤460px）渐进降级：先收 quota 重置列，再收 summary。 */
+@media (max-height:460px){
+  body.codex-mode .quota-line span:last-child{display:none}
+}
+@media (max-height:400px){
+  body.codex-mode .codex-summary{display:none}
+}
 .codex-summary{color:var(--tx2);font:10.5px var(--font-mono);margin-top:4px}
 .token-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px 8px;margin-top:7px}
+body.codex-mode.wx-expanded .token-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
 .token-item{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--tx2);font:10.5px var(--font-mono)}
 .token-item b{color:var(--tx);font-weight:600}
 .quota-line{display:flex;justify-content:space-between;gap:8px;color:var(--tx2);font:10.5px var(--font-mono);margin-top:5px}
@@ -242,6 +301,13 @@ footer{
   }
   body.wx-expanded .chartblock{min-height:98px}
   body.wx-expanded #week{height:clamp(78px,19vh,116px);min-height:78px;flex:none}
+  /* Codex 的窄幅展开回落单列（ZCode 同规则）；卡片与任务区内部滚动承接矮视口，
+     图表压缩到 codex 基线（低于 ZCode 窄幅的 98px/78px，避免矮视口超支）。 */
+  body.codex-mode.wx-expanded main{flex-direction:column;overflow:hidden}
+  body.codex-mode.wx-expanded .col-right{display:flex;flex-direction:column;overflow:hidden}
+  body.codex-mode.wx-expanded .card.codex-only{flex:1;min-height:0;overflow:auto;scrollbar-width:thin}
+  body.codex-mode.wx-expanded .chartblock{min-height:0;flex:none}
+  body.codex-mode.wx-expanded #week{height:clamp(64px,16vh,104px);min-height:64px;flex:none}
 }
 @media (max-width:380px){
   .hsub{display:none}
