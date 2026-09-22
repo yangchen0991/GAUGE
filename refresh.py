@@ -30,6 +30,7 @@ sidecar 契约（desktop/app.py 消费端，见 write_sidecar）：
   旧键与顺序不变），与 stats.py 双链共用同一套常数（测试锁一致）；
   sidecar 写失败仅警告不影响退出码（HTML 是主交付物，桌面侧有 stats 直查回退）。
 """
+import hashlib
 import json
 import os
 import re
@@ -164,7 +165,12 @@ def fin_of(f):
 
 
 def node_syntax_check(html_text):
-    """抽取成品 HTML 中内联 <script>，用 node --check 做语法检查。无 node 时跳过。"""
+    """抽取成品 HTML 中内联 <script>，用 node --check 做语法检查。无 node 时跳过。
+
+    条件化：逐 script 先算成品内容 sha1，与 <成品路径>.nodecheck 内记录一致
+    则跳过 spawn；不一致或哈希文件损坏/缺失才校验，校验后回写全量哈希。
+    哈希文件是可再生缓存，写坏只损失一次跳过机会，不影响正确性。
+    """
     node = shutil.which("node")
     if not node:
         print("[警告] 未找到 node，跳过 JS 语法检查（不影响数据正确性）。")
@@ -172,7 +178,19 @@ def node_syntax_check(html_text):
     scripts = re.findall(r"<script\b[^>]*>(.*?)</script>", html_text, re.S | re.I)
     if not scripts:
         die("成品 HTML 中未找到内联 <script>，模板可能已损坏。")
+    check_path = OUTPUT_PATH + ".nodecheck"
+    stored = None
+    try:
+        parsed = json.loads(Path(check_path).read_text(encoding="utf-8"))
+        if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+            stored = parsed
+    except (OSError, ValueError):
+        stored = None
+    hashes = [hashlib.sha1(code.encode("utf-8")).hexdigest() for code in scripts]
+    spawned = False
     for i, code in enumerate(scripts):
+        if stored is not None and i < len(stored) and stored[i] == hashes[i]:
+            continue
         fd, tmp = tempfile.mkstemp(suffix=".js", dir=BASE_DIR)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -185,6 +203,12 @@ def node_syntax_check(html_text):
                 os.unlink(tmp)
             except OSError:
                 pass
+        spawned = True
+    if spawned or stored != hashes:
+        tmp_path = check_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(hashes, f)
+        os.replace(tmp_path, check_path)
     return True
 
 

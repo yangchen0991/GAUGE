@@ -28,13 +28,30 @@ except ImportError:  # pragma: no cover - 仅支持旧版 Python 的降级路径
 
 __all__ = ["collect_codex", "codex_widget"]
 
-# v2：v1 缓存曾在现代格式文件（token_usage_record 与 token_count 并存，
-# 实测 133/136 同文件）里无条件派生 derived 记录，造成每响应双计污染；
-# schema_version 不匹配会让 _load_cache 整体重扫重建，一次性成本可接受。
-_CACHE_VERSION = 2
+# v4：v3 分片架构之上，legacy 派生记录的合成 id 从批次相对行号改为行首
+# 字节偏移（重放稳定身份）。真实机器上已存在 v3 缓存，旧 id 方案的派生
+# 记录可能已持久化，与新 id 混存会对同一物理行双计；升版触发全量干净
+# 重建（限流自愈），一次性成本可接受。
+_CACHE_VERSION = 4
 _CACHE_NAME_PREFIX = "codex-cache-"
+_INDEX_NAME = "codex-cache-index.json"
+_SNAPSHOT_NAME = "codex-snapshot.json"
+_HISTORY_CACHE_NAME = "codex-history.json"
+_LOCK_NAME = "codex-cache.lock"
+_SHARD_PREFIX = "codex-shard-"
+# 旧单文件缓存名 = 固定前缀 + 家目录哈希（v1/v2 十六进制长度不同，
+# 取宽区间）；"index" 非十六进制，天然不会被误认成旧文件。
+_LEGACY_CACHE_RE = re.compile(r"^codex-cache-[0-9a-f]{8,40}\.json$")
 _CACHE_LOCK = threading.RLock()
 _CACHE_LOCK_TIMEOUT = 1.2
+# 分片承载的数据键；index 元数据 = per-file 状态去掉这三键。
+_SHARD_DATA_KEYS = ("records", "snapshots", "quota")
+# 进程内驻留：快照（每进程首轮读盘一次，之后由保存端更新）与历史库扫描
+# 结果（mtime 未变时零 SQL）。键均为绝对路径字符串，测试各自的临时目录
+# 天然隔离。
+_SNAPSHOT_MEMO: dict[str, dict[str, Any] | None] = {}
+_HISTORY_MEMO: dict[str, dict[str, Any]] = {}
+_HISTORY_FILE_MEMO: dict[str, dict[str, Any] | None] = {}
 _TOOL_TYPES = {
     "commandExecution",
     "mcpToolCall",
@@ -491,10 +508,37 @@ def _read_state(path: Path | None, warnings: list[str]) -> dict[str, Any]:
     return result
 
 
-def _read_history(path: Path | None, warnings: list[str]) -> dict[str, Any]:
-    result: dict[str, Any] = {"ok": False, "turns": [], "tools": []}
+def _read_history(path: Path | None, warnings: list[str], persist_path: Path | None = None) -> dict[str, Any]:
+    """读历史库 turns/tools；mtime 未变时复用进程驻留或 codex-history.json。
+
+    刻意不做行级水位增量（rowid>水位）：Codex 历史库没有可靠的行更新探测，
+    旧行 UPDATE 不会推移水位，会静默漏数据；正确性优先，mtime 变化即全量
+    重扫。重扫在 item_type 列存在时用 WHERE 预过滤只取工具类行，旧库无该
+    列回退全表扫描 + json_extract 兜底判断的现状行为。
+    """
+    result: dict[str, Any] = {
+        "ok": False, "turns": [], "tools": [], "rescanned": False, "mtime_ns": None, "persist": None,
+    }
     if path is None:
         return result
+    try:
+        mtime_ns = int(path.stat().st_mtime_ns)
+    except OSError:
+        mtime_ns = None
+    result["mtime_ns"] = mtime_ns
+    if mtime_ns is not None:
+        memo = _HISTORY_MEMO.get(str(path))
+        if memo and memo.get("mtime_ns") == mtime_ns:
+            # turns 在聚合期会被就地补 n_responses，回副本防驻留数据被污染；
+            # tools 无就地修改，共享即可。
+            result.update({"ok": True, "turns": [dict(item) for item in memo["turns"]], "tools": list(memo["tools"])})
+            return result
+        if persist_path is not None:
+            persisted = _load_history_persist(persist_path, path, mtime_ns)
+            if persisted is not None:
+                _HISTORY_MEMO[str(path)] = {"mtime_ns": mtime_ns, "turns": persisted["turns"], "tools": persisted["tools"]}
+                result.update({"ok": True, "turns": [dict(item) for item in persisted["turns"]], "tools": list(persisted["tools"])})
+                return result
     try:
         with _open_ro(path) as connection:
             turn_rows = _select_rows(
@@ -533,9 +577,17 @@ def _read_history(path: Path | None, warnings: list[str]) -> dict[str, Any]:
                 available = {expr.strip('"') for expr in columns}
                 base = [expr for expr in expressions[:5] if expr.strip('"') in available]
                 if base:
+                    where = ""
+                    params: list[Any] = []
+                    if "item_type" in available:
+                        # 预过滤只认 item_type 列；item_type 为 NULL 的行不取，
+                        # 类型回退 json_type 的旧行为仅用于无该列的旧库。
+                        marks = ", ".join("?" for _ in _TOOL_TYPES)
+                        where = f' WHERE "item_type" IN ({marks})'
+                        params = sorted(_TOOL_TYPES)
                     try:
                         rows = connection.execute(
-                            f'SELECT {", ".join(base + expressions[5:])} FROM "thread_items"'
+                            f'SELECT {", ".join(base + expressions[5:])} FROM "thread_items"{where}', params
                         ).fetchall()
                     except sqlite3.Error:
                         rows = []
@@ -573,6 +625,20 @@ def _read_history(path: Path | None, warnings: list[str]) -> dict[str, Any]:
             result["ok"] = True
     except (OSError, sqlite3.Error) as exc:
         warnings.append(f"Codex 历史库读取失败：{_safe_text(exc, 160) or '未知错误'}")
+        return result
+    # 驻留与持久化载荷共用 pristine 副本；调用方拿到的是另一组副本。
+    pristine_turns = [dict(item) for item in result["turns"]]
+    pristine_tools = list(result["tools"])
+    if mtime_ns is not None:
+        _HISTORY_MEMO[str(path)] = {"mtime_ns": mtime_ns, "turns": pristine_turns, "tools": pristine_tools}
+        result["persist"] = {
+            "schema_version": _CACHE_VERSION,
+            "history_db": str(path),
+            "mtime_ns": mtime_ns,
+            "turns": pristine_turns,
+            "tools": pristine_tools,
+        }
+        result["rescanned"] = True
     return result
 
 
@@ -631,7 +697,11 @@ def _read_count_metadata(path: Path | None, allow: set[str]) -> dict[str, int] |
 
 
 def _read_log_diagnostics(path: Path | None) -> dict[str, int]:
-    """只按 level/target 聚合诊断日志，不读取 feedback_log_body 等正文。"""
+    """只按 level/target 聚合诊断日志，不读取 feedback_log_body 等正文。
+
+    聚合下推到 SQL GROUP BY，Python 只收聚合行；先按原始值分组、再经
+    _safe_text 映射后累加，与逐行口径逐字段一致（截断后同键的行会合并）。
+    """
     counts: dict[str, int] = {}
     if path is None:
         return counts
@@ -650,11 +720,12 @@ def _read_log_diagnostics(path: Path | None) -> dict[str, int]:
                     continue
                 quoted = ", ".join(f'"{name}"' for name in selected)
                 try:
-                    for item in connection.execute(f'SELECT {quoted} FROM "{table}"'):
+                    sql = f'SELECT {quoted}, COUNT(*) AS n FROM "{table}" GROUP BY {quoted}'
+                    for item in connection.execute(sql):
                         level = _safe_text(item["level"], 80) if "level" in selected else "unknown"
                         target = _safe_text(item["target"], 120) if "target" in selected else "unknown"
                         key = f"{level or 'unknown'}:{target or 'unknown'}"
-                        counts[key] = counts.get(key, 0) + 1
+                        counts[key] = counts.get(key, 0) + int(item["n"])
                 except sqlite3.Error:
                     continue
     except (OSError, sqlite3.Error):
@@ -784,52 +855,102 @@ def _cache_paths(home: Path, cache_dir: str | os.PathLike[str] | None) -> tuple[
             directory = _default_cache_dir(home)
     except OSError:
         directory = _default_cache_dir(home)
-    key = hashlib.sha256(str(home).encode("utf-8", "replace")).hexdigest()[:20]
-    return directory, directory / f"{_CACHE_NAME_PREFIX}{key}.json"
+    return directory, directory / _INDEX_NAME
+
+
+def _shard_name(source_key: str) -> str:
+    """分片名 = 源文件绝对路径 sha1 前 12 hex；跨进程确定且不碰撞。"""
+    return _SHARD_PREFIX + hashlib.sha1(source_key.encode("utf-8", "replace")).hexdigest()[:12] + ".json"
+
+
+def _find_legacy_cache_files(cache_dir: Path) -> list[Path]:
+    """v1/v2 单文件缓存（codex-cache-<家目录哈希>.json）；迁移成功后删除。"""
+    if not cache_dir.is_dir():
+        return []
+    return sorted(item for item in cache_dir.glob(f"{_CACHE_NAME_PREFIX}*.json") if _LEGACY_CACHE_RE.match(item.name))
 
 
 def _blank_cache(home: Path) -> dict[str, Any]:
-    return {"schema_version": _CACHE_VERSION, "source_home": str(home), "files": {}, "last_snapshot": None}
+    return {"schema_version": _CACHE_VERSION, "source_home": str(home), "files": {}, "history": {}}
+
+
+def _read_shard(path: Path) -> dict[str, list[Any]] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    result: dict[str, list[Any]] = {}
+    for key in _SHARD_DATA_KEYS:
+        value = data.get(key)
+        if not isinstance(value, list):
+            return None
+        result[key] = value
+    return result
 
 
 def _load_cache(path: Path, home: Path, warnings: list[str]) -> dict[str, Any]:
-    if not path.is_file():
-        return _blank_cache(home)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("schema_version") != _CACHE_VERSION or data.get("source_home") != str(home):
-            return _blank_cache(home)
-        if not isinstance(data.get("files"), dict):
-            raise ValueError("files 不是对象")
-        # 旧版本曾把半行原文 base64 写入 partial；读到后立即丢弃，
-        # offset 会让下一轮从源文件重读，不把历史正文继续带入缓存。
-        for state in data["files"].values():
-            if isinstance(state, dict):
-                state.pop("partial", None)
-                state["partial_bytes"] = _as_int(state.get("partial_bytes"), 0) or 0
-        return data
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        warnings.append(f"Codex 增量缓存损坏，已重建：{_safe_text(exc, 120) or '未知错误'}")
-    return _blank_cache(home)
+    """读 v3 索引与全部分片，拼装出与分片前同形的内存 files 状态。
+
+    读不到有效索引（无文件、v2 单文件在场、source_home 不匹配）一律静默
+    走 _blank_cache 全量重建路径；只有"索引文件在但解析失败"才告警，
+    与 v2 损坏缓存的处理口径一致。分片缺失/损坏时丢弃该源文件状态，
+    从 offset 0 重建自愈。
+    """
+    files: dict[str, dict[str, Any]] = {}
+    history_state: dict[str, Any] = {}
+    if path.is_file():
+        data: dict[str, Any] | None = None
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("索引不是对象")
+            if parsed.get("schema_version") != _CACHE_VERSION or parsed.get("source_home") != str(home):
+                # source_home 不匹配（共用缓存目录的多 home）静默重建。
+                parsed = None
+            elif not isinstance(parsed.get("files"), dict):
+                raise ValueError("files 不是对象")
+            data = parsed
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            warnings.append(f"Codex 缓存索引损坏，已重建：{_safe_text(exc, 120) or '未知错误'}")
+        if isinstance(data, dict):
+            raw_history = data.get("history")
+            history_state = dict(raw_history) if isinstance(raw_history, dict) else {}
+            for key, meta in data["files"].items():
+                if not isinstance(meta, dict) or not isinstance(meta.get("shard"), str):
+                    continue
+                shard = _read_shard(path.parent / str(meta["shard"]))
+                if shard is None:
+                    warnings.append(f"Codex 分片不可读，已重建：{_safe_text(meta['shard'], 80) or '未知分片'}")
+                    continue
+                state = dict(meta)
+                state.update(shard)
+                files[str(key)] = state
+    return {"schema_version": _CACHE_VERSION, "source_home": str(home), "files": files, "history": history_state}
 
 
-def _merge_cache_states(current: dict[str, Any], disk: dict[str, Any]) -> dict[str, Any]:
-    """在写锁内合并并发刷新结果，避免较旧读快照覆盖已推进的 offset。"""
-    merged = dict(current)
-    # 先取出再守卫：对两次独立的 .get 结果做 isinstance 无法收窄第一次的值。
-    current_raw = current.get("files")
-    disk_raw = disk.get("files")
-    current_files = current_raw if isinstance(current_raw, dict) else {}
-    disk_files = disk_raw if isinstance(disk_raw, dict) else {}
-    files: dict[str, Any] = {}
-    for key in set(current_files) | set(disk_files):
-        left = current_files.get(key)
-        right = disk_files.get(key)
+def _merge_cache_states(current: dict[str, Any], disk: dict[str, Any]) -> tuple[dict[str, Any], dict[str, bool]]:
+    """在写锁内合并并发刷新结果，避免较旧读快照覆盖已推进的 offset。
+
+    返回合并后的 files 映射与逐键归属：True 表示当前调用者的状态胜出
+    （分片数据在内存中），False 表示磁盘状态更新（分片以磁盘为准，禁止
+    用本轮可能较旧的解析结果回写）。键序取排序保证序列化字节稳定。
+    """
+    merged: dict[str, Any] = {}
+    owners: dict[str, bool] = {}
+    for key in sorted(set(current) | set(disk)):
+        left = current.get(key)
+        right = disk.get(key)
         if not isinstance(left, dict):
-            files[key] = right
+            merged[key] = right
+            owners[key] = False
             continue
         if not isinstance(right, dict):
-            files[key] = left
+            merged[key] = left
+            owners[key] = True
             continue
         # 指纹/大小变化代表截断或替换，当前调用者的重建状态优先；
         # 同一文件则保留 offset 更大的状态。
@@ -845,16 +966,66 @@ def _merge_cache_states(current: dict[str, Any], disk: dict[str, Any]) -> dict[s
             left_offset = _as_int(left.get("offset"), 0) or 0
             right_offset = _as_int(right.get("offset"), 0) or 0
             chosen = left if left_offset >= right_offset else right
-        files[key] = chosen
-    merged["files"] = files
-    left_snapshot = current.get("last_snapshot")
-    right_snapshot = disk.get("last_snapshot")
-    # 默认值已是 0，_as_int 不会返回 None；or 0 仅用于收窄比较类型。
-    left_time = (_as_int(left_snapshot.get("generated_at_ms"), 0) or 0) if isinstance(left_snapshot, dict) else 0
-    right_time = (_as_int(right_snapshot.get("generated_at_ms"), 0) or 0) if isinstance(right_snapshot, dict) else 0
-    if right_time > left_time:
-        merged["last_snapshot"] = right_snapshot
-    return merged
+        merged[key] = chosen
+        owners[key] = chosen is left
+    return merged, owners
+
+
+def _load_previous_snapshot(cache_dir: Path, home: Path) -> dict[str, Any] | None:
+    """最近成功快照；每进程首轮从磁盘加载一次，之后由保存端驻留更新。
+
+    sources.home 不匹配（共用缓存目录时的其他 home 数据）视为无 previous，
+    防止把别的 home 的数据当成本地 stale 复读。
+    """
+    path = cache_dir / _SNAPSHOT_NAME
+    key = str(path)
+    if key not in _SNAPSHOT_MEMO:
+        data: dict[str, Any] | None = None
+        try:
+            if path.is_file():
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(parsed, dict)
+                    and isinstance(parsed.get("sources"), dict)
+                    and parsed["sources"].get("home") == str(home)
+                ):
+                    data = parsed
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            data = None
+        _SNAPSHOT_MEMO[key] = data
+    return _SNAPSHOT_MEMO[key]
+
+
+def _load_history_persist(persist_path: Path, db_path: Path, mtime_ns: int) -> dict[str, Any] | None:
+    """跨进程重启的历史扫描持久化（codex-history.json）；每进程只读盘一次。
+
+    绑定校验三要素：schema、来源历史库路径、库 mtime——任一不符即视为
+    无效，走全量重扫，绝不复用可能过期的 turns/tools。
+    """
+    key = str(persist_path)
+    if key not in _HISTORY_FILE_MEMO:
+        data: dict[str, Any] | None = None
+        try:
+            if persist_path.is_file():
+                parsed = json.loads(persist_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(parsed, dict)
+                    and parsed.get("schema_version") == _CACHE_VERSION
+                    and parsed.get("history_db") == str(db_path)
+                    and parsed.get("mtime_ns") == mtime_ns
+                    and isinstance(parsed.get("turns"), list)
+                    and isinstance(parsed.get("tools"), list)
+                ):
+                    data = parsed
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            data = None
+        _HISTORY_FILE_MEMO[key] = data
+    data = _HISTORY_FILE_MEMO[key]
+    # 命中时复验 history_db 绑定：同一缓存目录被另一个 home 轮换使用时，
+    # 驻留数据属于别的历史库，mtime 碰巧相同也不能放行（跨 home 串染窗口）。
+    if data is not None and data.get("mtime_ns") == mtime_ns and data.get("history_db") == str(db_path):
+        return data
+    return None
 
 
 @contextlib.contextmanager
@@ -886,49 +1057,148 @@ def _cache_file_lock(lock_path: Path) -> Iterator[bool]:
                 pass
 
 
-def _write_cache_payload(path: Path, cache: dict[str, Any], warnings: list[str]) -> bool:
-    """在调用者已持有文件锁时原子写入缓存。"""
+def _atomic_write_text(path: Path, text: str, warnings: list[str], label: str) -> int:
+    """tmp + fsync + os.replace 原子写文本；返回写入字节数，失败记警告返回 0。"""
+    data = text.encode("utf-8")
     temporary: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 读取当前磁盘版本也在同一互斥区内；两个刷新进程即使
-        # 各自从旧快照开始，也不会用旧 offset 覆盖较新的推进。
-        if path.is_file():
-            try:
-                on_disk = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(on_disk, dict) and on_disk.get("schema_version") == _CACHE_VERSION:
-                    cache = _merge_cache_states(cache, on_disk)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                pass
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, prefix=".codex-cache-", suffix=".tmp", delete=False
-        ) as handle:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=".gauge-", suffix=".tmp", delete=False) as handle:
             temporary = Path(handle.name)
-            json.dump(cache, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        return True
-    except (OSError, TypeError, ValueError) as exc:
-        warnings.append(f"Codex 增量缓存写入失败：{_safe_text(exc, 140) or '未知错误'}")
+        return len(data)
+    except OSError as exc:
+        warnings.append(f"{label}写入失败：{_safe_text(exc, 140) or '未知错误'}")
         if temporary is not None:
             try:
                 temporary.unlink()
             except OSError:
                 pass
-        return False
+        return 0
 
 
-def _write_cache(path: Path, cache: dict[str, Any], warnings: list[str], *, lock_held: bool = False) -> bool:
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    if lock_held:
-        return _write_cache_payload(path, cache, warnings)
-    with _CACHE_LOCK:
-        with _cache_file_lock(lock_path) as acquired:
-            if not acquired:
-                warnings.append("Codex 增量缓存锁定超时，本次不写缓存")
-                return False
-            return _write_cache_payload(path, cache, warnings)
+def _save_cache(
+    index_path: Path,
+    home: Path,
+    cache: dict[str, Any],
+    snapshot: dict[str, Any],
+    warnings: list[str],
+    *,
+    dirty_keys: set[str],
+    history_state: dict[str, Any],
+    history_persist: tuple[Path, dict[str, Any]] | None,
+) -> bool:
+    """保存阶段，调用者必须已持有 _CACHE_LOCK + 目录文件锁。
+
+    逐字节不动的写策略：分片只在"本轮推进过且合并归属当前"时写，且与
+    磁盘字节相同则跳过；索引内容与磁盘一致则不重写；快照按非 stale 轮
+    语义总是落盘；index 未引用的孤儿分片顺带回收（均可再生）。
+    """
+    files = cache.get("files", {})
+    entries: dict[str, dict[str, Any]] = {}
+    for key, state in files.items():
+        if not isinstance(state, dict):
+            continue
+        entry = {name: value for name, value in state.items() if name not in _SHARD_DATA_KEYS}
+        shard = entry.get("shard")
+        if not isinstance(shard, str) or not shard:
+            shard = _shard_name(key)
+            entry["shard"] = shard
+            state["shard"] = shard
+        entries[key] = entry
+    # 磁盘重读也在锁内：两个刷新进程即使各自从旧快照开始，也不会互相
+    # 覆盖已推进的 offset（防并发双刷新的合并语义与 v2 一致）。
+    disk_raw: str | None = None
+    disk_files: dict[str, Any] = {}
+    try:
+        if index_path.is_file():
+            disk_raw = index_path.read_text(encoding="utf-8")
+            parsed = json.loads(disk_raw)
+            if (
+                isinstance(parsed, dict)
+                and parsed.get("schema_version") == _CACHE_VERSION
+                and parsed.get("source_home") == str(home)
+                and isinstance(parsed.get("files"), dict)
+            ):
+                disk_files = parsed["files"]
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        disk_files = {}
+    merged, owners = _merge_cache_states(entries, disk_files)
+    for key in sorted(dirty_keys):
+        state = files.get(key)
+        winner = merged.get(key)
+        if not isinstance(state, dict) or not isinstance(winner, dict) or not owners.get(key):
+            # 合并归属磁盘：磁盘分片已是更新版本，回写会丢并发进程的数据。
+            continue
+        payload = {name: state.get(name, []) for name in _SHARD_DATA_KEYS}
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        shard_path = index_path.parent / str(winner["shard"])
+        try:
+            if shard_path.is_file() and shard_path.read_text(encoding="utf-8") == text:
+                continue
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
+        if not _atomic_write_text(shard_path, text, warnings, "Codex 分片"):
+            # 提交指针永不越过未持久化数据：分片写失败时本轮 index 回退为
+            # 磁盘旧元数据（旧 fingerprint/offset/shard 原样），磁盘无旧元
+            # 数据（首轮新文件）则整键省略；下轮从旧 offset 重解析，绝不
+            # 静默跳过已推进的 offset。
+            stale_entry = disk_files.get(key)
+            if isinstance(stale_entry, dict):
+                merged[key] = stale_entry
+            else:
+                merged.pop(key, None)
+    if history_persist is not None:
+        persist_path, persist_payload = history_persist
+        _atomic_write_text(
+            persist_path, json.dumps(persist_payload, ensure_ascii=False, separators=(",", ":")),
+            warnings, "Codex 历史缓存",
+        )
+    index_text = json.dumps(
+        {"schema_version": _CACHE_VERSION, "source_home": str(home), "files": merged, "history": history_state},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    if index_text != disk_raw:
+        _atomic_write_text(index_path, index_text, warnings, "Codex 缓存索引")
+    compact = _compact_snapshot(snapshot)
+    snapshot_path = index_path.parent / _SNAPSHOT_NAME
+    snapshot_text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    keep_disk = False
+    try:
+        if snapshot_path.is_file():
+            disk_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(disk_snapshot, dict)
+                and isinstance(disk_snapshot.get("sources"), dict)
+                and disk_snapshot["sources"].get("home") == str(home)
+                and (_as_int(disk_snapshot.get("generated_at_ms"), 0) or 0) > (_as_int(compact.get("generated_at_ms"), 0) or 0)
+            ):
+                # 并发进程已写入更新的快照：保留磁盘版并同步驻留。
+                keep_disk = True
+                _SNAPSHOT_MEMO[str(snapshot_path)] = disk_snapshot
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        keep_disk = False
+    if not keep_disk:
+        if _atomic_write_text(snapshot_path, snapshot_text, warnings, "Codex 快照"):
+            _SNAPSHOT_MEMO[str(snapshot_path)] = compact
+    referenced = {
+        str(entry["shard"])
+        for entry in merged.values()
+        if isinstance(entry, dict) and isinstance(entry.get("shard"), str)
+    }
+    try:
+        for shard in index_path.parent.glob(f"{_SHARD_PREFIX}*.json"):
+            if shard.name not in referenced:
+                try:
+                    shard.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return True
 
 
 def _event_ms(event: dict[str, Any], payload: dict[str, Any] | None = None) -> int | None:
@@ -1125,7 +1395,7 @@ def _parse_rollout_line(
     raw: bytes,
     source_thread_id: str | None,
     source_key: str,
-    line_no: int,
+    line_offset: int,
     warnings: list[str],
     context: dict[str, Any],
     modern: bool = False,
@@ -1164,7 +1434,7 @@ def _parse_rollout_line(
                 "model": _safe_text(payload.get("model") or event.get("model") or context.get("model"), 160),
                 "provider": _safe_text(payload.get("provider") or event.get("provider") or context.get("provider"), 160),
                 "vector": vector,
-                "position": line_no,
+                "position": line_offset,
             }
         record = None
         # 文件级现代格式门：token_usage_record 与 token_count 实测并存于同一
@@ -1178,10 +1448,12 @@ def _parse_rollout_line(
                 cached_tokens = last_vector.get("cached_input_tokens")
                 cache_write_tokens = last_vector.get("cache_write_input")
                 reasoning_tokens = last_vector.get("reasoning_output_tokens")
-                # 合成 id 只需在同一文件内按行区分；sha1(source_key) 前缀保证跨
-                # 文件不碰撞，同一行重复解析得到同一 id，可参与 response_id 去重。
+                # 合成 id 用行首字节偏移做重放稳定身份；sha1(source_key) 前缀
+                # 保证跨文件不碰撞。行号不可用：解析起点是 records+snapshots
+                # 计数而非文件头，增量批次边界或 offset 回退重解析会让同一
+                # 物理行得到不同 id，绕过 response_id 去重造成同一响应双计。
                 digest = hashlib.sha1(source_key.encode("utf-8", "replace")).hexdigest()[:8]
-                synthetic_id = f"legacy-{digest}-{line_no}"
+                synthetic_id = f"legacy-{digest}-{line_offset}"
                 record = {
                     "id": synthetic_id,
                     "response_id": synthetic_id,
@@ -1210,14 +1482,18 @@ def _process_rollout_files(
     max_bytes: int,
     max_seconds: float,
     warnings: list[str],
-) -> tuple[int, int, int, bool]:
-    """按增量 offset 读取 rollout，返回 processed、total、pending、complete。"""
+) -> tuple[int, int, int, bool, set[str]]:
+    """按增量 offset 读取 rollout，返回 processed、total、pending、complete 与脏键集。
+
+    脏键 = 本轮状态发生变化的源文件，是保存阶段"只重写有变化分片"的依据。
+    """
     started = time.monotonic()
     budget = max(0, int(max_bytes))
     consumed = 0
     total_files = len(rollout_sources)
     processed_files = 0
     pending_bytes = 0
+    dirty: set[str] = set()
     # 最近修改的日志先处理，offset 会持续推进，避免大文件永远霸占首轮预算。
     ordered: list[tuple[float, Path, str | None]] = []
     for path, thread_id in rollout_sources:
@@ -1232,16 +1508,33 @@ def _process_rollout_files(
             files[source_key]["missing"] = True
     for _mtime, path, source_thread_id in ordered:
         source_key = str(path)
+        is_new = source_key not in files
         state = files.setdefault(
             source_key,
             {"offset": 0, "partial_bytes": 0, "fingerprint": None, "content_fingerprint": None, "modern": False, "context": {}, "records": [], "snapshots": [], "quota": []},
         )
         state["missing"] = False
+        before = {name: state.get(name) for name in ("offset", "size", "mtime_ns", "fingerprint", "content_fingerprint")}
+        if is_new:
+            # 新文件必须落分片：index 引用的分片缺失会让下一轮误判损坏重建。
+            dirty.add(source_key)
         try:
             stat = path.stat()
             current_size = int(stat.st_size)
-            current_fingerprint = _fingerprint(path)
-            current_content_fingerprint = _content_fingerprint(path)
+            current_mtime = _as_int(getattr(stat, "st_mtime_ns", None), 0)
+            if (
+                state.get("fingerprint")
+                and state.get("content_fingerprint")
+                and _as_int(state.get("mtime_ns"), -1) == current_mtime
+                and _as_int(state.get("size"), -1) == current_size
+            ):
+                # 指纹短路：mtime_ns+size 均未变且此前已算过双指纹，内容不会
+                # 变，跳过开文件与两次哈希；stat 本身保留。
+                current_fingerprint = state["fingerprint"]
+                current_content_fingerprint = state["content_fingerprint"]
+            else:
+                current_fingerprint = _fingerprint(path)
+                current_content_fingerprint = _content_fingerprint(path)
         except OSError:
             state["missing"] = True
             warnings.append(f"Codex rollout 文件不可读：{_safe_text(path.name, 160) or '未知文件'}")
@@ -1262,13 +1555,18 @@ def _process_rollout_files(
             and state.get("content_fingerprint") != current_content_fingerprint
         )
         if offset > current_size or prefix_changed or same_size_changed:
+            dirty.add(source_key)
             state.clear()
             state.update({"offset": 0, "partial_bytes": 0, "fingerprint": None, "content_fingerprint": None, "modern": False, "context": {}, "records": [], "snapshots": [], "quota": []})
             offset = 0
         state["fingerprint"] = current_fingerprint
         state["content_fingerprint"] = current_content_fingerprint
         state["size"] = current_size
-        state["mtime_ns"] = _as_int(getattr(stat, "st_mtime_ns", None), 0)
+        state["mtime_ns"] = current_mtime
+        if before != {name: state.get(name) for name in before}:
+            # 指纹/大小/mtime 任一变化都进索引；本轮只碰 stat 的文件分片
+            # 数据不变，由保存端字节比对兜底跳过无差异重写。
+            dirty.add(source_key)
         if offset >= current_size:
             processed_files += 1
             continue
@@ -1292,7 +1590,9 @@ def _process_rollout_files(
         complete_end = combined.rfind(b"\n") + 1
         complete_bytes = combined[:complete_end] if complete_end else b""
         remainder = combined[complete_end:] if complete_end else combined
-        line_no = len(state.get("records", [])) + len(state.get("snapshots", [])) + 1
+        # 行身份 = 行首字节偏移（重放稳定）：解析批次边界变化或 offset 回退
+        # 重解析时，同一物理行恒得到同一合成 id，交给 response_id 去重折叠。
+        line_offset = offset
         context = state.setdefault("context", {})
         processed_bytes = 0
         if complete_bytes:
@@ -1302,10 +1602,10 @@ def _process_rollout_files(
                 if time.monotonic() >= started + max(0.01, float(max_seconds)):
                     break
                 record, snapshot, quota = _parse_rollout_line(
-                    raw_line.rstrip(b"\r\n"), source_thread_id, source_key, line_no, warnings, context,
+                    raw_line.rstrip(b"\r\n"), source_thread_id, source_key, line_offset, warnings, context,
                     bool(state.get("modern")),
                 )
-                line_no += 1
+                line_offset += len(raw_line)
                 processed_bytes += len(raw_line)
                 if record is not None:
                     state.setdefault("records", []).append(record)
@@ -1320,6 +1620,8 @@ def _process_rollout_files(
         advanced = processed_bytes
         state["offset"] = offset + advanced
         state["partial_bytes"] = len(combined) - advanced
+        if advanced:
+            dirty.add(source_key)
         if state["offset"] >= current_size and not state["partial_bytes"]:
             processed_files += 1
         else:
@@ -1329,7 +1631,7 @@ def _process_rollout_files(
     # consumed<=budget 恒真（读取量受 read_limit=min(budget-consumed, …) 钳制），
     # 不参与判定；complete 只看文件推进与遗留字节。
     complete = processed_files == total_files and pending_bytes == 0
-    return processed_files, total_files, pending_bytes, complete
+    return processed_files, total_files, pending_bytes, complete, dirty
 
 
 def _legacy_usage(files: dict[str, dict[str, Any]], warnings: list[str]) -> list[dict[str, Any]]:
@@ -1461,16 +1763,20 @@ def collect_codex(
     sqlite_home = _resolve_sqlite_home(source_home, configured_sqlite_home)
     dbs = _db_candidates(sqlite_home, source_home)
     cache_path: Path | None = None
+    cache_dir_path: Path | None = None
+    legacy_cache_files: list[Path] = []
     cache: dict[str, Any] = _blank_cache(source_home)
     try:
-        _cache_dir, cache_path = _cache_paths(source_home, cache_dir)
+        cache_dir_path, cache_path = _cache_paths(source_home, cache_dir)
         cache = _load_cache(cache_path, source_home, warnings)
+        legacy_cache_files = _find_legacy_cache_files(cache_dir_path)
     except (OSError, ValueError) as exc:
         warnings.append(f"Codex 增量缓存不可用：{_safe_text(exc, 140) or '未知错误'}")
-    previous = cache.get("last_snapshot") if isinstance(cache.get("last_snapshot"), dict) else None
+    previous = _load_previous_snapshot(cache_dir_path, source_home) if cache_dir_path is not None else None
+    history_cache_path = cache_dir_path / _HISTORY_CACHE_NAME if cache_dir_path is not None else None
     try:
         state = _read_state(dbs.get("state"), warnings)
-        history = _read_history(dbs.get("history"), warnings)
+        history = _read_history(dbs.get("history"), warnings, history_cache_path)
         goals = _read_goals(dbs.get("goals"), warnings)
         threads = state.get("threads", [])
         projects = state.get("projects", [])
@@ -1497,7 +1803,7 @@ def collect_codex(
         # rollout_path 只作为内部索引；线程契约不导出源文件绝对路径。
         for thread in threads:
             thread.pop("rollout_path", None)
-        processed, total_files, pending_bytes, complete = _process_rollout_files(
+        processed, total_files, pending_bytes, complete, dirty_keys = _process_rollout_files(
             cache.setdefault("files", {}), rollout_sources, max_bytes, max_seconds, warnings
         )
         raw_records = _legacy_usage(cache.get("files", {}), warnings)
@@ -1528,9 +1834,9 @@ def collect_codex(
             goals_rows = stale.get("goals", goals_rows)
             environment = stale.get("environment", environment)
             quota = stale.get("quota", quota)
-            # 缓存每轮无条件回存，previous 的 generated_at_ms 在连续 stale 时
-            # 已是上一轮刷新时刻；last_success_at 只在成功轮更新，应优先沿用，
-            # 缺失时才回退旧口径，否则成功时点会逐轮向前漂移。
+            # stale 轮零缓存写入：快照是上次成功数据的复读，回写零新信息只会
+            # 刷新 generated_at_ms；跳过后 previous 恒为最近成功快照，
+            # last_success_at 只在成功轮更新，天然不会逐轮向前漂移。
             previous_diagnostics = stale.get("diagnostics")
             last_success_at = _as_int(previous_diagnostics.get("last_success_at")) if isinstance(previous_diagnostics, dict) else None
             if last_success_at is None:
@@ -1591,11 +1897,38 @@ def collect_codex(
                 },
             }
         )
-        if cache_path is not None:
-            cache["last_snapshot"] = _compact_snapshot(snapshot)
-            cache["schema_version"] = _CACHE_VERSION
-            cache["source_home"] = str(source_home)
-            _write_cache(cache_path, cache, warnings)
+        if source_ok and cache_path is not None and cache_dir_path is not None:
+            # stale 轮（含源不可用且无 previous 的轮）到此为止：stale 快照是
+            # 上次成功数据的复读，空快照回写会污染恢复源，两者都零写入。
+            history_persist: tuple[Path, dict[str, Any]] | None = None
+            raw_watermark = cache.get("history")
+            history_watermark: dict[str, Any] = dict(raw_watermark) if isinstance(raw_watermark, dict) else {}
+            if (
+                history.get("rescanned")
+                and history.get("ok")
+                and complete
+                and isinstance(history.get("mtime_ns"), int)
+                and isinstance(history.get("persist"), dict)
+            ):
+                # 历史扫描持久化冻结为仅在完整轮覆盖写：预算截断轮保留旧缓存。
+                history_persist = (history_cache_path or cache_dir_path / _HISTORY_CACHE_NAME, dict(history["persist"]))
+                history_watermark = {"mtime_ns": history["mtime_ns"]}
+            with _CACHE_LOCK:
+                with _cache_file_lock(cache_dir_path / _LOCK_NAME) as acquired:
+                    if acquired:
+                        _save_cache(
+                            cache_path, source_home, cache, snapshot, warnings,
+                            dirty_keys=dirty_keys, history_state=history_watermark, history_persist=history_persist,
+                        )
+                    else:
+                        warnings.append("Codex 增量缓存锁定超时，本次不写缓存")
+            if legacy_cache_files:
+                # v3 文件已成功落盘，v1/v2 单文件缓存完成迁移，可安全删除。
+                for legacy_file in legacy_cache_files:
+                    try:
+                        legacy_file.unlink()
+                    except OSError:
+                        pass
             snapshot["warnings"] = list(dict.fromkeys(warnings))
     except Exception as exc:  # 不能让一个损坏能力把整个 widget 变成空白。
         warnings.append(f"Codex 数据聚合失败：{_safe_text(exc, 160) or '未知错误'}")
