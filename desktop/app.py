@@ -515,13 +515,14 @@ def smoke_run(window):
             except Exception as e:  # noqa: BLE001
                 result["errors"].append("evaluate_js 失败：%r" % (e,))
         result["today"] = today_stats()
+        # 冒烟验证的是链路完整性而非当日用量：全库 requests>0 + 标题 + 零错误。
+        # 今日统计仅作信息字段保留——零用量日（周末/新装机）不应误报失败。
         result["ok"] = bool(
             result["title"] == WINDOW_TITLE
             and isinstance(result["requests"], int)
             and result["requests"] > 0
             and isinstance(result["today"], dict)
             and isinstance(result["today"].get("requests"), int)
-            and result["today"]["requests"] > 0
             and not result["errors"]
         )
     except Exception as e:  # noqa: BLE001
