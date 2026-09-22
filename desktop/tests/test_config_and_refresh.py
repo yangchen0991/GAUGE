@@ -307,3 +307,43 @@ class TestRefreshSidecar:
         sc, _data, _refresh = self._run_pipeline(tmp_path, monkeypatch, with_error=False)
         assert sc["last_error"] is None
         assert sc["today"]["requests"] == 1
+
+
+# ---------- 回归锁：真机 pythonw 下刷新子进程不得闪现控制台黑窗 ----------
+class TestRunRefreshNoWindow:
+    """真机反馈：每次数据刷新（含 5 分钟自动刷新）黑窗一闪而过约 3.5 秒。
+
+    根因：桌面主进程由 pythonw（GUI 子系统、无控制台）启动，Windows 会为
+    其拉起的控制台子系统子进程（refresh.py 数据管线）分配新控制台窗口。
+    本测试锁死 run_refresh 在 Windows 下必须以 CREATE_NO_WINDOW 拉起子进程，
+    且 capture_output/timeout/env 等既有参数原样传递——旗标不得破坏输出
+    采集与超时语义。非 Windows 平台旗标常量不存在，跳过。
+    """
+
+    def test_run_refresh_passes_create_no_window(self, monkeypatch: pytest.MonkeyPatch):
+        import os
+        import subprocess
+        import sys
+
+        from monitor import refreshctl
+
+        if os.name != "nt":
+            pytest.skip("CREATE_NO_WINDOW 为 Windows 专有旗标，仅 Windows 平台验证")
+        captured: dict = {}
+
+        def _fake_run(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            # 最小 stub：退出码 0、空输出，让 run_refresh 正常走通返回 (True, "")
+            return subprocess.CompletedProcess(args[0], 0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert refreshctl.run_refresh() == (True, "")
+        kw = captured["kwargs"]
+        # 核心：Windows 下 creationflags 必须含 CREATE_NO_WINDOW（漏传即红）
+        assert kw["creationflags"] & subprocess.CREATE_NO_WINDOW
+        # 既有参数原样传递：管道采集、超时、UTF-8 环境与命令行主体均不变
+        assert kw["capture_output"] is True
+        assert kw["timeout"] == refreshctl.REFRESH_TIMEOUT
+        assert kw["env"]["PYTHONIOENCODING"] == "utf-8"
+        assert captured["args"][0] == [sys.executable, str(refreshctl.REFRESH_PY)]

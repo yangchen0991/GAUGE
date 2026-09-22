@@ -246,6 +246,12 @@ def run_refresh() -> Tuple[bool, str]:
             return False, "内联刷新异常：%r" % (e,)
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"   # 子进程经管道输出统一 UTF-8，避免本地码页歧义
+    # pythonw（GUI 子系统）无控制台父进程，Windows 会为控制台子系统子进程分配
+    # 新控制台窗口——真机上每次刷新黑窗闪烁约 3.5 秒的根因。CREATE_NO_WINDOW
+    # 抑制该窗口；capture_output 已通过管道接管子进程输出，无窗口不影响日志
+    # 采集。旗标常量仅 Windows 的 subprocess 存在；非 Windows 传 0 即无任何
+    # 创建旗标，行为与原先完全一致。
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
         r = subprocess.run(
             [sys.executable, str(REFRESH_PY)],
@@ -253,6 +259,7 @@ def run_refresh() -> Tuple[bool, str]:
             capture_output=True,
             timeout=REFRESH_TIMEOUT,
             env=env,
+            creationflags=creationflags,
         )
     except subprocess.TimeoutExpired:
         return False, "刷新超时（>%d 秒）" % REFRESH_TIMEOUT
