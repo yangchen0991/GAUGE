@@ -8,9 +8,12 @@ __pycache__/
 # 数据快照成品（refresh.py + template.html 可重新生成，含活库快照不入库）
 AI-Agent监控台.html
 AI-Agent监控台.data.json
+# W8 双形态：shell 壳（同一模板产出，数据来自 sidecar fetch，可再生）
+AI-Agent监控台.shell.html
 # 崩溃窗口残留的原子写临时文件（tmp + os.replace 中断产物）
 AI-Agent监控台.data.json.tmp
 AI-Agent监控台.html.tmp
+AI-Agent监控台.shell.html.tmp
 brand/
 desktop/widget.json
 desktop/build/

@@ -333,6 +333,11 @@ footer{max-width:1280px;margin:20px auto 0;padding:14px 16px 26px;border-top:1px
 
 <script>
 'use strict';
+// 数据全局：成品单文件内嵌整包 JSON（file:// 快照模式，语义不变）；shell 形态
+// 置 null，由文末装载分派 fetch 同目录 sidecar 后并入（W8 双形态）。
+// 成品保持 const 声明原文：hydrateData 仅 shell 路径会调用，成品不存在二次
+// 赋值；shell 由 refresh.build_shell_html 在构建期改写为 var，成品路径行为
+// 与字节零变化（既有测试按 const 前缀提取 DATA，注释里不得复现该字节序列）。
 const DATA = /*__DATA_PLACEHOLDER__*/null;
 
 /* ============ 基础工具 ============ */
@@ -1220,22 +1225,14 @@ function renderAll(){
   renderAbout();
 }
 
-// 事件绑定与首次渲染入口（Tab 切换/范围选择/明细筛选/分页/单价恢复默认）
-function init(){
-  tipEl=$('tt');
-  if(!DATA){
-    var f=$('fatal');
-    f.style.display='block';
-    f.textContent='尚未注入数据：请先运行 refresh.py（或双击 刷新数据.bat）生成 AI-Agent监控台.html 后再打开。当前打开的是模板文件。';
-    return;
-  }
+// 事件绑定（一次性）：Tab 切换/范围选择/明细筛选/分页/单价恢复默认。
+// 只含纯事件挂接，不含数据相关 DOM 填充——热替换后无需也无法重绑。
+function bindEvents(){
   window.addEventListener('error',function(e){
     var f=$('fatal');
     f.style.display='block';
     f.textContent='页面脚本出错：'+(e&&e.message?e.message:'未知错误');
   });
-  loadPrices();
-  buildSVC();
 
   document.querySelectorAll('#tabs button').forEach(function(b){
     b.addEventListener('click',function(){
@@ -1265,37 +1262,6 @@ function init(){
       renderTrend();
     });
   });
-
-  var selA=$('sf-agent');
-  DATA.agents.forEach(function(a,i){
-    var o=elIn(selA,'option','',a.label);
-    o.value=String(i);o.title=a.id;
-  });
-  var selM=$('sf-model');
-  DATA.models.forEach(function(m2,i){
-    var o=elIn(selM,'option','',m2);
-    o.value=String(i);
-  });
-  var selP=$('sf-prov');
-  DATA.providers.forEach(function(p,i){
-    var o=elIn(selP,'option','',p.label);
-    o.value=String(i);o.title=p.id;
-  });
-  var projCount={};
-  DATA.sessions.forEach(function(s){
-    var key=s.dir||'(未知目录)';
-    projCount[key]=(projCount[key]||0)+1;
-  });
-  var selJ=$('sf-proj');
-  Object.keys(projCount).sort(function(a,b){return projCount[b]-projCount[a];}).forEach(function(key){
-    var o=elIn(selJ,'option','',dirName(key)+'（'+projCount[key]+'）');
-    o.value=key;o.title=key;
-  });
-  // 孤儿请求提示：session_id 无对应会话记录的请求已统一归入「未知会话」合成会话
-  if(DATA.meta.orphans>0){
-    elIn(document.querySelector('#sec-sessions .filters'),'span','muted',
-         '含 '+fmtInt(DATA.meta.orphans)+' 条无对应会话记录的请求（已归入「未知会话」）');
-  }
 
   function bindSf(id,key,evt){
     $(id).addEventListener(evt||'input',function(){
@@ -1328,14 +1294,160 @@ function init(){
   $('ss-prev').addEventListener('click',function(){state.page--;renderSessions();});
   $('ss-next').addEventListener('click',function(){state.page++;renderSessions();});
   $('btn-price-reset').addEventListener('click',resetPrices);
+}
 
-  // 首次渲染：只渲染当前激活页，其余数据页标记脏（切换 tab 时按需渲染）；
-  // 单价编辑器与数据说明页不依赖 VIEW/时间范围，仍一次性渲染。
+// 数据驱动的 DOM 填充（幂等，可随数据重入）：下拉项按当前数据重建，并恢复
+// state.sf 里的用户筛选值；对应选项已随数据消失时选择器显示为空、用户重选或
+// 点「重置」即可——这是热替换保留 selection 语义（见 hydrateData 注释）下的已知取舍。
+function populateFilters(){
+  var selA=$('sf-agent');selA.textContent='';
+  DATA.agents.forEach(function(a,i){
+    var o=elIn(selA,'option','',a.label);
+    o.value=String(i);o.title=a.id;
+  });
+  var selM=$('sf-model');selM.textContent='';
+  DATA.models.forEach(function(m2,i){
+    var o=elIn(selM,'option','',m2);
+    o.value=String(i);
+  });
+  var selP=$('sf-prov');selP.textContent='';
+  DATA.providers.forEach(function(p,i){
+    var o=elIn(selP,'option','',p.label);
+    o.value=String(i);o.title=p.id;
+  });
+  var projCount={};
+  DATA.sessions.forEach(function(s){
+    var key=s.dir||'(未知目录)';
+    projCount[key]=(projCount[key]||0)+1;
+  });
+  var selJ=$('sf-proj');selJ.textContent='';
+  Object.keys(projCount).sort(function(a,b){return projCount[b]-projCount[a];}).forEach(function(key){
+    var o=elIn(selJ,'option','',dirName(key)+'（'+projCount[key]+'）');
+    o.value=key;o.title=key;
+  });
+  // 孤儿请求提示：session_id 无对应会话记录的请求已统一归入「未知会话」合成会话；
+  // 重入时先移除旧提示再按当前数据重建，避免热替换重复插入
+  var oldHint=$('sf-orphans');
+  if(oldHint&&oldHint.parentNode)oldHint.parentNode.removeChild(oldHint);
+  if(DATA.meta.orphans>0){
+    var hint=document.createElement('span');
+    hint.className='muted';hint.id='sf-orphans';
+    hint.textContent='含 '+fmtInt(DATA.meta.orphans)+' 条无对应会话记录的请求（已归入「未知会话」）';
+    document.querySelector('#sec-sessions .filters').appendChild(hint);
+  }
+  $('sf-agent').value=state.sf.agent;
+  $('sf-model').value=state.sf.model;
+  $('sf-prov').value=state.sf.prov;
+  $('sf-proj').value=state.sf.proj;
+}
+
+// 数据驱动渲染（可重入入口）：成品首装与 shell 热替换共用同一条路径；
+// 不绑定事件、不重置 state——范围/页签/筛选/分页/展开全部保持现状语义。
+// 首次渲染：只渲染当前激活页，其余数据页标记脏（切换 tab 时按需渲染）；
+// 单价编辑器与数据说明页不依赖 VIEW/时间范围，仍一次性渲染。
+function applyData(){
+  loadPrices();
+  buildSVC();
+  populateFilters();
   refreshSVCost();buildView();markAllDirty();renderActive();
   renderEditor();renderAbout();
 }
 
-init();
+// 唯一初始化入口：成品单文件（同步）与 shell 形态（fetch 成功后）都走这里，
+// 渲染行为与拆分前逐项一致，仅装载时机按形态分派。
+function boot(){
+  tipEl=$('tt');
+  if(!DATA){
+    var f=$('fatal');
+    f.style.display='block';
+    f.textContent='尚未注入数据：请先运行 refresh.py（或双击 刷新数据.bat）生成 AI-Agent监控台.html 后再打开。当前打开的是模板文件。';
+    return;
+  }
+  bindEvents();
+  applyData();
+}
+
+/* ============ W8 双形态装载与热替换（仅 shell 形态生效） ============ */
+// shell 形态：winchild 经 pywebview 内置静态服务加载本文件（http(s) 协议），
+// 数据不内嵌，从同目录 sidecar fetch 并入；成品单文件（file:// 快照）与模板
+// 直开不走此分支，装载路径与现状零差异。
+var SIDECAR_URL='./AI-Agent监控台.data.json';
+
+// 把 sidecar 字段并入页面 DATA 状态（白名单：仅页面 DATA 契约字段，贴纸侧统计
+// 键 today/week/plan/window5h/thisweek 等不并入）。首装与热替换共用；热替换
+// 不触碰 state——现状 RELOAD 的 location.reload() 本会整页重置视图，热替换保持
+// 当前页签/筛选/分页/展开属行为增强（冻结契约允许并要求注明）。
+function hydrateData(fetched){
+  var payload=fetched&&fetched.data;
+  if(!payload||typeof payload!=='object')return false;
+  if(!DATA)DATA={};
+  var keys=['meta','agents','providers','models','pricing','pricing_usd','sessions','requests','tools','agg'];
+  for(var i=0;i<keys.length;i++){if(keys[i] in payload)DATA[keys[i]]=payload[keys[i]];}
+  // GAUGE_CODEX 白名单消费口径不变：页面侧仍从 window.GAUGE_CODEX 读，仅来源改为 sidecar
+  window.GAUGE_CODEX=('codex' in fetched)?fetched.codex:null;
+  // 与成品 PLATFORM_DATA 注入等价：codex.js 平台状态栏读取 meta.available/error
+  window.GAUGE_ZCODE_META=DATA.meta||null;
+  return !!(DATA.meta&&DATA.agents&&DATA.requests&&DATA.sessions);
+}
+
+function fetchSidecar(){
+  // 同名原子替换的 sidecar 加时间戳参数 cache-bust，避免命中任何中间缓存层
+  return fetch(SIDECAR_URL+'?ts='+Date.now()).then(function(r){
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    return r.json();
+  });
+}
+
+function loadShellData(){
+  fetchSidecar().then(function(fetched){
+    if(!hydrateData(fetched))throw new Error('sidecar 缺少页面数据字段');
+    boot();                        // 与成品共用同一初始化入口
+    registerApplyLatest();
+    reapplyPlatform();             // GAUGE_ZCODE_META 就绪后刷新平台状态栏（P2-1）
+  }).catch(function(e){
+    // fetch 失败：复用既有 #fatal 错误呈现，不新造 UI；成品/模板路径文案不受影响
+    var f=$('fatal');
+    f.style.display='block';
+    f.textContent='shell 形态加载数据失败：'+(e&&e.message?e.message:'未知错误')+
+      '。请确认本文件同目录存在 AI-Agent监控台.data.json（先运行 refresh.py 生成三件），或直接打开 AI-Agent监控台.html。';
+  });
+}
+
+// 热替换入口（仅 shell 模式注册；成品模式不注册，外部 window.__gaugeApplyLatest && …
+// 调用天然短路安全）。以 sidecar.generated_at 兼作 revision 口径：与当前一致则
+// no-op；不同则并入数据（同步 window.GAUGE_CODEX）并重渲染，用户视图状态保持。
+// 平台状态栏与 Codex 看板重入（P2-1/P2-2）：codex.js 在脚本加载时按当时可用
+// 的 GAUGE_ZCODE_META/GAUGE_CODEX 渲染状态栏与看板；shell 注水发生在其后，
+// 需经既有 gaugeApplyPlatform 幂等重入一次。gaugePlatformState 是 codex.js
+// 暴露的只读快照（当前平台+revision）；全局不存在时跳过——成品路径不注册
+// __gaugeApplyLatest、loadShellData 不执行，故成品零触碰。
+function reapplyPlatform(){
+  if(typeof window.gaugePlatformState!=='function'||typeof window.gaugeApplyPlatform!=='function')return;
+  window.gaugeApplyPlatform(window.gaugePlatformState());
+}
+
+function registerApplyLatest(){
+  var busy=false;
+  window.__gaugeApplyLatest=function(){
+    if(busy)return Promise.resolve(false);
+    busy=true;
+    return fetchSidecar().then(function(fetched){
+      var cur=(DATA&&DATA.meta&&DATA.meta.generated_at)||null;
+      if(!fetched||!fetched.data||fetched.generated_at===cur)return false;
+      if(!hydrateData(fetched))return false;
+      applyData();
+      reapplyPlatform();           // active 平台为 codex 时同步重渲染看板（P2-2）
+      return true;
+    }).catch(function(){return false;}).then(function(v){busy=false;return v;});
+  };
+}
+
+// 装载分派（判别逻辑冻结）：内嵌数据非 null → 成品同步初始化（现状路径）；
+// 内嵌为 null 且 http(s) → shell 异步装载；其余（模板直开 file://）→ 保留
+// boot 内既有的「尚未注入数据」提示文案。
+if(DATA){ boot(); }
+else if(location.protocol==='http:'||location.protocol==='https:'){ loadShellData(); }
+else { boot(); }
 </script>
 <script>/*__PLATFORM_DATA__*/</script>
 <script>/*__CODEX_SCRIPT__*/</script>

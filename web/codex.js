@@ -6,20 +6,39 @@
 (function () {
   'use strict';
 
-  var snapshot = window.GAUGE_CODEX || {};
-  var threads = Array.isArray(snapshot.threads) ? snapshot.threads : [];
-  var usage = Array.isArray(snapshot.usage) ? snapshot.usage : [];
-  var turns = Array.isArray(snapshot.turns) ? snapshot.turns : [];
-  var tools = Array.isArray(snapshot.tools) ? snapshot.tools : [];
-  var edges = Array.isArray(snapshot.edges) ? snapshot.edges : [];
-  var threadById = new Map(threads.map(function (thread) { return [thread.id, thread]; }));
-  var childrenById = new Map();
-  edges.forEach(function (edge) {
-    var children = childrenById.get(edge.parent_id) || new Set();
-    children.add(edge.child_id);
-    childrenById.set(edge.parent_id, children);
-  });
-  var projectById = new Map((snapshot.projects || []).map(function (project) { return [project.id, project]; }));
+  // 惰性捕获（W8 shell 双形态异步注水）：shell 形态下本脚本执行时
+  // window.GAUGE_CODEX 仍为 null，数据由页面 fetch sidecar 之后才挂回全局；
+  // 若沿用加载时一次性捕获，Codex 看板将永远停留在“尚未读取”空态。因此改为
+  // 访问器 + 按快照对象身份重建索引：成品形态快照在脚本加载前已置位，首建后
+  // 身份不再变化，行为与原一次性捕获完全一致。统计口径仅在 rebuildIndex 内
+  // 原样搬运，未做任何增删。
+  function codexSnapshot() { return window.GAUGE_CODEX || EMPTY_SNAPSHOT; }
+  var EMPTY_SNAPSHOT = {};   // 空快照恒定身份：无数据时反复 render 不触发重建
+  var snapshot = null;
+  var threads = [], usage = [], turns = [], tools = [], edges = [];
+  var threadById = new Map(), childrenById = new Map(), projectById = new Map();
+
+  // 从当前快照重建闭包索引（含按 thread_id 的父子边与项目映射）；
+  // 快照对象身份未变时直接返回，成品路径反复 render 零额外开销。
+  function rebuildIndex() {
+    var current = codexSnapshot();
+    if (current === snapshot) return;
+    snapshot = current;
+    threads = Array.isArray(current.threads) ? current.threads : [];
+    usage = Array.isArray(current.usage) ? current.usage : [];
+    turns = Array.isArray(current.turns) ? current.turns : [];
+    tools = Array.isArray(current.tools) ? current.tools : [];
+    edges = Array.isArray(current.edges) ? current.edges : [];
+    threadById = new Map(threads.map(function (thread) { return [thread.id, thread]; }));
+    childrenById = new Map();
+    edges.forEach(function (edge) {
+      var children = childrenById.get(edge.parent_id) || new Set();
+      children.add(edge.child_id);
+      childrenById.set(edge.parent_id, children);
+    });
+    projectById = new Map((current.projects || []).map(function (project) { return [project.id, project]; }));
+  }
+  rebuildIndex();
 
   function readPreference(key, fallback) {
     try { return JSON.parse(localStorage.getItem(key)) || fallback; }
@@ -145,6 +164,14 @@
     if (isCodex) render();
   }
   window.gaugeApplyPlatform = applyPlatform;
+  // 只读快照钩子（W8 shell 注水重入）：页面在 GAUGE_ZCODE_META/GAUGE_CODEX
+  // 注水完成后经 gaugeApplyPlatform 重入一次，用当前平台与 revision 刷新状态
+  // 栏（P2-1）；active 平台为 codex 时 applyPlatform 内部 render() 同步重渲染
+  // 看板（P2-2）。同 revision 可过守卫、同平台仅重写状态与可见性，重复调用
+  // 幂等；桌面确认链（desktopReady → get_platform）不受影响。
+  window.gaugePlatformState = function () {
+    return { platform: activePlatform, revision: platformRevision };
+  };
   window.gaugeOpenTask = function (id) {
     if (typeof id !== 'string') return;
     view.tab = 'tasks'; view.taskId = id; view.page = 0;
@@ -431,6 +458,9 @@
     return '<option value="">' + allLabel + '</option>' + values.map(function (item) { return '<option value="' + escapeHtml(item[0]) + '" ' + (current === item[0] ? 'selected' : '') + '>' + escapeHtml(item[1]) + '</option>'; }).join('');
   }
   function render() {
+    // render 是看板唯一输出网关（平台切换/筛选/翻页都经此），先按当前全局
+    // 快照重建索引，保证 shell 异步注水后的首次渲染即用最新数据。
+    rebuildIndex();
     var projects = (snapshot.projects || []).map(function (project) { return [project.id, project.name || project.id]; });
     var models = Array.from(new Set(usage.map(function (record) { return record.model; }).concat(threads.map(function (thread) { return thread.model; })).filter(Boolean))).sort().map(function (model) { return [model, model]; });
     // 来源目录变更或模型记录消失时，移除旧筛选，避免界面显示“全部”却仍按旧值过滤。

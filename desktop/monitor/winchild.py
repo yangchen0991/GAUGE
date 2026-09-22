@@ -12,11 +12,13 @@
 可导入模块中——frozen（PyInstaller）形态下 spawn 按模块路径反序列化 target，
 定义在 __main__（app.py）会让子进程引导卡住（py-spy 栈空，项目记忆已记录）。
 """
+import inspect
 import json
 import logging
 import os
 import sys
 import threading
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import webview
@@ -50,12 +52,46 @@ WIDGET_RADIUS_CSS = 28
 USAGE_PAGE_URL = "https://bigmodel.cn/coding-plan/personal/usage"
 
 
+# ---- W8 双形态：shell+sidecar 优先装载 ----
+def _shell_html_path() -> Optional[Path]:
+    """shell 形态路径：与成品同目录同名主干（refresh.py 三件产出的派生口径一致）。
+
+    产物缺失（老版本刷新残留或被用户清理）时返回 None，按现状回退成品单文件。
+    """
+    path = HTML_PATH.with_name(HTML_PATH.name[:-5] + ".shell.html")
+    return path if path.is_file() else None
+
+
+def _builtin_http_server_supported() -> bool:
+    """探测当前 pywebview 是否具备「内置本地静态服务」能力（http_server 参数）。
+
+    参数挂载点随版本变化：3.x 在 create_window，4.0+ 移到 start()，且本地路径
+    URL（非 file:// URI、非 http(s)）会自动经内置 Bottle 静态服务加载——shell
+    的相对 fetch 因此天然可用；file:// URI 不经过该服务、相对 fetch 会被
+    WebView2 拦截，所以 shell 必须以普通本地路径传入。两处签名都探测不到
+    http_server 时判定不支持，主面板回退加载成品单文件（现状路径）。
+    """
+    for fn in (getattr(webview, "start", None), webview.create_window):
+        if fn is None:
+            continue
+        try:
+            if "http_server" in inspect.signature(fn).parameters:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 class _WindowState:
     """窗口子进程状态：主面板与贴纸两个窗口对象、就绪事件、退出标志与贴纸配置缓存。"""
 
     def __init__(self) -> None:
         self.window: Any = None              # 主面板窗口
         self.widget: Any = None              # 桌面贴纸窗口
+        # 主面板装载形态：True = shell+sidecar（RELOAD 走数据热替换）；
+        # False = 成品单文件回退（RELOAD 保持整页 location.reload()）。
+        # 创建后只写一次、命令循环启动前发布（Thread start 自带 happens-before）。
+        self.window_shell_mode = False
         self.window_ready = threading.Event()
         self.widget_ready = threading.Event()
         self.widget_native_hwnd: Optional[int] = None
@@ -762,7 +798,15 @@ def _window_cmd_loop(state: "_WindowState", pipe: Any) -> None:
         elif cmd == "RELOAD":
             log("[win] 收到 RELOAD → 重载页面")
             try:
-                state.window.evaluate_js("location.reload()")
+                if state.window_shell_mode:
+                    # shell 形态：只热替换数据，避免 13MB 级页面整页重载重解析（W8）。
+                    # 页面侧按 sidecar.generated_at 判重；函数未注册时 && 短路无害
+                    # （如页面尚在 fetch 首装数据，本次放弃，下次刷新再热替换）。
+                    state.window.evaluate_js(
+                        "window.__gaugeApplyLatest && window.__gaugeApplyLatest();")
+                else:
+                    # 回退模式（成品单文件）：保持现状整页重载
+                    state.window.evaluate_js("location.reload()")
             except Exception:
                 _log.exception("[win] 页面重载失败")
         elif cmd == "EXIT":
@@ -947,15 +991,32 @@ def window_process_main(pipe: Any, widget_cfg: Optional[Dict[str, Any]] = None) 
             assert isinstance(active_platform, str)  # is_valid_platform 已保证为字符串，仅供 mypy 收窄
             state.active_platform = active_platform
 
+    # W8 双形态：shell+sidecar 优先（内置静态服务下相对 fetch 天然可用）；
+    # 探测不支持、产物缺失或创建抛 TypeError 时回退现状——加载成品单文件。
+    # TypeError 只可能来自 create_window 参数面（签名探测误判的版本差异），
+    # 此时该窗口尚未进入 GUI 循环，重建无副作用。
+    shell_path = _shell_html_path() if _builtin_http_server_supported() else None
     try:
-        window = webview.create_window(
-            WINDOW_TITLE,
-            HTML_PATH.as_uri(),
-            width=1280,
-            height=820,
-            min_size=(960, 600),
-            js_api=MainApi(state),
-        )
+        try:
+            window = webview.create_window(
+                WINDOW_TITLE,
+                str(shell_path) if shell_path is not None else HTML_PATH.as_uri(),
+                width=1280,
+                height=820,
+                min_size=(960, 600),
+                js_api=MainApi(state),
+            )
+        except TypeError:
+            _log.exception("[win] shell 形态窗口创建失败，回退成品单文件")
+            shell_path = None
+            window = webview.create_window(
+                WINDOW_TITLE,
+                HTML_PATH.as_uri(),
+                width=1280,
+                height=820,
+                min_size=(960, 600),
+                js_api=MainApi(state),
+            )
         _CHILD_PIPE[0] = pipe
         state.widget = webview.create_window(
             WIDGET_TITLE,
@@ -980,6 +1041,8 @@ def window_process_main(pipe: Any, widget_cfg: Optional[Dict[str, Any]] = None) 
 
     state.window = window
     assert window is not None   # webview stubs 标注 Optional[Window]；创建失败已在 except 分支返回
+    # shell 标记在命令循环启动前一次性发布，RELOAD 分支据此分派热替换/整页重载
+    state.window_shell_mode = shell_path is not None
     window.events.loaded += lambda: on_loaded(state)
     window.events.closing += lambda: on_closing(state)
     _bind_widget_events(state, state.widget)
@@ -989,7 +1052,13 @@ def window_process_main(pipe: Any, widget_cfg: Optional[Dict[str, Any]] = None) 
     ).start()
 
     try:
-        webview.start()
+        start_params = inspect.signature(webview.start).parameters
+        if state.window_shell_mode and "http_server" in start_params:
+            # 显式启用内置 HTTP 服务（探测已确认支持）：本地路径在 4.x+ 也会被
+            # 自动判定需要服务，这里显式化，不依赖自动行为。
+            webview.start(http_server=True)
+        else:
+            webview.start()
     except Exception:
         _log.exception("[win] GUI 主循环异常退出")
         return 1

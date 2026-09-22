@@ -7,6 +7,13 @@ refresh.py — 从本机 ZCode 会话库（只读）抽取统计数据，注入 
 - 内置自检：行扫描与聚合 SQL 两条独立路径核对通过才写成品文件。
 - 失败时不产出损坏 HTML：全部校验通过后才原子替换（保留旧文件）。
 
+main() 只做流程编排；产出三件（W8 双形态）：
+  ①成品单文件 AI-Agent监控台.html（现状语义不变：内嵌全部数据，浏览器快照模式）
+  ②shell 形态 AI-Agent监控台.shell.html（同一模板同源注入，数据占位与
+   GAUGE_CODEX 桥置 null，供 winchild 内置静态服务加载后 fetch sidecar）
+  ③sidecar AI-Agent监控台.data.json（既有键之上 additive 追加顶层 data=页面
+   DATA 契约字段、codex=GAUGE_CODEX 快照；schema_version 不动，停写保留语义不变）
+
 main() 只做流程编排；九步主流程各自封装为单一职责函数：
   load_template          步骤 1  读取模板并校验数据占位符
   open_db                步骤 2  只读建 WAL 快照连接
@@ -15,8 +22,9 @@ main() 只做流程编排；九步主流程各自封装为单一职责函数：
   selfcheck              步骤 4  聚合 SQL（路径 B）与路径 A 逐项核对
   build_payload          步骤 5  组装 DATA（契约见下）
   serialize_and_inject   步骤 6  JSON 回读验证 + 转义注入 + 外链检查
-  node_syntax_check      步骤 6b  成品内联 JS 语法校验
+  node_syntax_check      步骤 6b  成品/壳内联 JS 语法校验（独立哈希缓存）
   atomic_write           步骤 7  tmp + os.replace 原子写入
+  build_shell_html       步骤 7b  生成 shell 形态（成品同模板同源注入）
   write_sidecar          步骤 8  原子写桌面 sidecar（AI-Agent监控台.data.json）
 
 DATA 契约（template.html 消费端）：
@@ -164,12 +172,13 @@ def fin_of(f):
     return 2
 
 
-def node_syntax_check(html_text):
+def node_syntax_check(html_text, check_path=None):
     """抽取成品 HTML 中内联 <script>，用 node --check 做语法检查。无 node 时跳过。
 
-    条件化：逐 script 先算成品内容 sha1，与 <成品路径>.nodecheck 内记录一致
+    条件化：逐 script 先算成品内容 sha1，与 <产物路径>.nodecheck 内记录一致
     则跳过 spawn；不一致或哈希文件损坏/缺失才校验，校验后回写全量哈希。
     哈希文件是可再生缓存，写坏只损失一次跳过机会，不影响正确性。
+    check_path 可为 shell 形态指定独立缓存文件，避免与成品的哈希缓存互相覆盖。
     """
     node = shutil.which("node")
     if not node:
@@ -178,7 +187,8 @@ def node_syntax_check(html_text):
     scripts = re.findall(r"<script\b[^>]*>(.*?)</script>", html_text, re.S | re.I)
     if not scripts:
         die("成品 HTML 中未找到内联 <script>，模板可能已损坏。")
-    check_path = OUTPUT_PATH + ".nodecheck"
+    if check_path is None:
+        check_path = OUTPUT_PATH + ".nodecheck"
     stored = None
     try:
         parsed = json.loads(Path(check_path).read_text(encoding="utf-8"))
@@ -575,17 +585,49 @@ def serialize_and_inject(tpl, payload, n_sess):
 
 
 # ---------- 步骤 7：原子写入 ----------
-def atomic_write(out):
-    """tmp + os.replace 原子写入成品；失败保留旧文件。"""
-    tmp_out = str(OUTPUT_PATH) + ".tmp"
+def atomic_write(out, output_path=None):
+    """tmp + os.replace 原子写入成品；失败保留旧文件。output_path 供 shell 复用。"""
+    target = OUTPUT_PATH if output_path is None else output_path
+    tmp_out = str(target) + ".tmp"
     try:
         with open(tmp_out, "w", encoding="utf-8", errors="replace", newline="\n") as f:
             f.write(out)
-        os.replace(tmp_out, OUTPUT_PATH)
+        os.replace(tmp_out, target)
     except PermissionError:
-        die("无法写入成品文件（可能正被浏览器/编辑器锁定）：%s" % OUTPUT_PATH)
+        die("无法写入成品文件（可能正被浏览器/编辑器锁定）：%s" % target)
     except OSError as e:
         die("写入成品文件失败：%s" % e)
+
+
+def shell_output_path():
+    """shell 形态产物路径：与成品同目录同名主干（从 OUTPUT_PATH 运行时派生）。
+
+    与 sidecar 同一派生口径、不设模块级常量：冻结形态 refreshctl._run_refresh_inline
+    在 exec_module 之后才把 OUTPUT_PATH 覆盖为 exe 目录，模块顶层常量会错指向
+    _MEIPASS 只读临时区（同 write_sidecar 的既有注释）。
+    """
+    return OUTPUT_PATH[:-5] + ".shell.html"
+
+
+def build_shell_html(tpl):
+    """生成 shell 形态：与成品同一模板同源注入，仅数据两处占位不同。
+
+    - DATA 占位符置 null：shell 不内嵌数据，页面运行时 fetch sidecar 并入；
+    - GAUGE_CODEX 桥置 null：页面取到 sidecar 后再设 window.GAUGE_CODEX
+      （白名单消费方式不变，只是来源改为 fetch）。
+    样式/脚本/其余注入与成品完全同源（tpl 已含 codex 资产注入），外链检查
+    与成品同口径，维持离线零依赖约束。
+    声明改写：仅 shell 把 const DATA 改为 var（页面 hydrateData 需要二次赋值）；
+    成品保持 const 原文，hydrateData 在成品路径永不调用，行为与字节零变化。
+    """
+    out = tpl.replace("const DATA =", "var DATA =")
+    out = out.replace(PLACEHOLDER, "null")
+    out = out.replace("/*__PLATFORM_DATA__*/", "window.GAUGE_CODEX=null;")
+    if PLACEHOLDER in out or "/*__PLATFORM_DATA__*/" in out:
+        die("shell 模板占位符替换异常，中止写入。")
+    if re.search(r'(src|href)\s*=\s*["\']https?://', out, re.I):
+        die("shell HTML 出现外部 URL 的 src/href 引用（违反离线零依赖约束），中止写入。")
+    return out
 
 
 # ---------- 步骤 8：桌面 sidecar（单一统计链） ----------
@@ -793,8 +835,18 @@ def build_zcode_widget(scan_mu, meta_generated_at):
     return data
 
 
-def write_sidecar(scan_mu, meta_generated_at, codex=None, zcode_error=None):
-    """写双平台桌面快照；保留旧版顶层字段，平台失败不会伪装成另一平台。"""
+def write_sidecar(scan_mu, meta_generated_at, codex=None, zcode_error=None,
+                  page_payload=None):
+    """写双平台桌面快照；保留旧版顶层字段，平台失败不会伪装成另一平台。
+
+    W8 双形态追加（additive，既有键零删除零改名、schema_version 不动）：
+    - codex     顶层键 = GAUGE_CODEX 快照对象（与成品 HTML 注入的
+                window.GAUGE_CODEX 同一对象；大载荷单副本，页面 DATA 不携带）；
+    - data      顶层键 = 页面 DATA 契约字段（meta/agents/…/agg，即成品内嵌
+                legacy 载荷同一对象），shell 形态页面 fetch 后把字段并入页面
+                DATA 状态；单独成键避免与既有顶层 pricing（价目 map 形状）冲突。
+    generated_at 既有顶层键兼作热替换 revision 口径（与 data.meta.generated_at
+    同值，由 main 传同一来源）。"""
     from gauge_data import codex_widget
     data = build_zcode_widget(scan_mu, meta_generated_at)
     if zcode_error:
@@ -803,6 +855,10 @@ def write_sidecar(scan_mu, meta_generated_at, codex=None, zcode_error=None):
     if codex is not None:
         platforms["codex"] = codex_widget(codex)
     data.update(schema_version=2, platforms=platforms)
+    if page_payload is not None:
+        data["data"] = {key: value for key, value in page_payload.items()
+                        if key != "codex"}
+    data["codex"] = codex
     sidecar_path = str(Path(OUTPUT_PATH).with_suffix(".data.json"))
     tmp = sidecar_path + ".tmp"
     try:
@@ -905,9 +961,18 @@ def main():
     out = serialize_and_inject(tpl, payload, len(payload["sessions"]))
     node_syntax_check(out)
     atomic_write(out)
-    write_sidecar(scan_mu, payload["meta"]["generated_at"], codex, zcode_error)
+    # W8 双形态：shell 与成品同一模板同源注入，仅数据占位置 null（页面运行时
+    # fetch sidecar）。独立 nodecheck 缓存文件，避免与成品的哈希缓存互相覆盖。
+    shell = build_shell_html(tpl)
+    node_syntax_check(shell, OUTPUT_PATH[:-5] + ".shell.nodecheck")
+    shell_path = shell_output_path()
+    atomic_write(shell, shell_path)
+    write_sidecar(scan_mu, payload["meta"]["generated_at"], codex, zcode_error,
+                  page_payload=payload)
     print("双平台快照：ZCode %s；Codex %s" % (payload["meta"]["status"], codex.get("status")))
     print("成品：%s（%.2f MB）" % (OUTPUT_PATH, os.path.getsize(OUTPUT_PATH) / 1048576.0))
+    print("shell：%s（%.2f MB）；sidecar 携带页面数据与 codex 快照" % (
+        shell_path, os.path.getsize(shell_path) / 1048576.0))
     return 0
 
 
