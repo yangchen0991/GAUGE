@@ -430,3 +430,9 @@ def test_stale_snapshot_exposes_last_success_at_after_sources_vanish(tmp_path: P
     assert second["available"] is True
     assert any("stale" in item for item in second["warnings"])
 
+    # 多轮 stale 回归锁定：stale 轮快照同样回存缓存，第三轮必须仍指向
+    # 首轮成功时点；曾因取上一轮刷新时刻导致 last_success_at 逐轮漂移。
+    third = collect_codex(home=home, cache_dir=cache)
+    assert third["diagnostics"]["stale"] is True
+    assert third["diagnostics"]["last_success_at"] == success_at
+

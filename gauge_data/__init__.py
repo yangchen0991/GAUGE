@@ -1525,7 +1525,13 @@ def collect_codex(
             goals_rows = stale.get("goals", goals_rows)
             environment = stale.get("environment", environment)
             quota = stale.get("quota", quota)
-            last_success_at = _as_int(stale.get("generated_at_ms"))
+            # 缓存每轮无条件回存，previous 的 generated_at_ms 在连续 stale 时
+            # 已是上一轮刷新时刻；last_success_at 只在成功轮更新，应优先沿用，
+            # 缺失时才回退旧口径，否则成功时点会逐轮向前漂移。
+            previous_diagnostics = stale.get("diagnostics")
+            last_success_at = _as_int(previous_diagnostics.get("last_success_at")) if isinstance(previous_diagnostics, dict) else None
+            if last_success_at is None:
+                last_success_at = _as_int(stale.get("generated_at_ms"))
             warnings.append("Codex 当前源不可用，保留最近一次成功数据（stale）")
         # n_responses 在 turns 组装处就地补齐：stale 复用的回合同样按当前
         # usage 口径覆盖，避免页面读到缺失键。
