@@ -1,7 +1,8 @@
-"""Isolated, opt-in WebView2 probe. Never starts the tray or writes widget.json.
+"""独立可选的 WebView2 原生探针：不启动托盘、不写 widget.json。
 
-Run with --output <directory>. Close the widget or send Ctrl+C to exit.
-The local command file accepts only wide/compact/snapshot/exit for this probe.
+以 --output <目录> 运行；关闭贴纸窗口或 Ctrl+C 退出。
+本地命令文件 command.txt 接受 wide/compact/snapshot/exit（另有 move-next
+跨屏移动）；探针把几何快照 JSON 写进 --output 目录。
 """
 import argparse
 import datetime as dt

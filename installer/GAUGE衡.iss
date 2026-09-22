@@ -25,7 +25,7 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-VersionInfoVersion=1.2.0.0
+VersionInfoVersion={#MyAppVersion}.0
 ; 按用户安装：lowest 下 {autopf} = {localappdata}\Programs（可写，无需管理员）
 PrivilegesRequired=lowest
 DefaultDirName={autopf}\GAUGE 衡
@@ -52,7 +52,7 @@ CloseApplicationsFilter=*.exe
 RestartApplications=no
 ; 产物
 OutputDir=out
-OutputBaseFilename=GAUGE-衡-Setup-1.2.0
+OutputBaseFilename=GAUGE-衡-Setup-{#MyAppVersion}
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"

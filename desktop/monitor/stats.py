@@ -59,6 +59,8 @@ def _open_ro() -> sqlite3.Connection:
     """只读打开会话库（mode=ro + query_only + busy_timeout，绝不写入）。"""
     uri = DB_PATH.as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5)
+    # 本链是托盘侧同步调用的回退路径（tooltip/推送兜底），锁等待过长会卡住
+    # 托盘交互；5s 是“等一下而不是立刻失败”的沿用折中值，调整前需实测。
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA query_only=1")
     return conn

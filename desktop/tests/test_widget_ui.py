@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Static UI-contract checks for the self-contained desktop widget page.
+"""自包含贴纸页（widget.html）的静态 UI 契约检查。
 
-Browser behavior is exercised separately with the Playwright CLI. These checks
-keep the frozen bridge names, data semantics, and accessibility guardrails
-visible to the normal project test collection without adding a test dependency.
+浏览器实际行为由 Playwright CLI 另行测试；本文件只负责把冻结的桥名、数据
+语义与无障碍护栏保持在常规 pytest 收集可见的范围内，且不引入任何测试依赖。
 """
 from pathlib import Path
 
@@ -19,7 +18,7 @@ def test_public_bridge_contract_is_present() -> None:
     source = widget_text()
     for export in (
         "window.renderWidget=renderWidget",
-        "window.renderWeek",  # the named function remains callable by the bridge
+        "window.renderWeek",  # 具名函数保持可被桥直接调用
         "window.renderWidgetLayout",
         "window.renderWidgetSettings",
         "window.renderRefreshState",

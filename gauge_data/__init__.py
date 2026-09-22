@@ -338,6 +338,9 @@ def _open_ro(path: Path) -> Iterator[sqlite3.Connection]:
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
+        # Codex 侧库是宿主应用的热库，这里只是只读旁路：锁竞争时快速让路
+        # （350ms，与 connect timeout 同值）而不是阻塞刷新管线；个别表读空
+        # 由 _select_rows 兜底，下一轮刷新自然补齐。
         connection.execute("PRAGMA busy_timeout=350")
         yield connection
     finally:

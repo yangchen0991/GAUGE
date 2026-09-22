@@ -50,7 +50,8 @@ DB_PATH = os.environ.get("AGENT_MONITOR_DB") or os.path.expanduser("~/.zcode/cli
 DB_DISPLAY = DB_PATH + "（只读导出）"
 PLACEHOLDER = "/*__DATA_PLACEHOLDER__*/null"
 
-# ---- 显示名映射（与 template.html 内回退映射保持一致；原始 id 始终保留在 DATA 中）----
+# ---- 显示名映射（唯一权威定义；template.html 已无回退映射、直接消费 DATA 里的
+# label，原始 id 仍始终保留在 DATA.agents[].id / providers[].id 中）----
 AGENT_LABELS = {
     "zcode-agent": "主会话（Astra）",
     "zcode-astra-luna:luna-worker": "Luna Worker",
@@ -204,6 +205,8 @@ def open_db():
     try:
         conn = sqlite3.connect(uri, uri=True)
         conn.isolation_level = None  # 显式事务管理
+        # 活库正被 ZCode 写入时等锁（最多 10s）而不是整轮刷新直接失败——
+        # 刷新是低频批处理、等得起。沿用值，调整前需实测宿主写事务时长分布。
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA query_only=1")   # 运行时禁止任何写操作
         conn.execute("BEGIN DEFERRED")        # WAL 快照：两条自检路径看到同一份数据

@@ -199,7 +199,7 @@ def set_click_through(hwnd: int, on: bool) -> bool:
 
 
 def configure_process_dpi() -> bool:
-    """Request per-monitor DPI before WinForms creates any HWND in this process."""
+    """在 WinForms 于本进程创建任何 HWND 之前，先请求 Per-Monitor DPI 感知。"""
     try:
         import ctypes
         api = ctypes.windll.user32.SetProcessDpiAwarenessContext
@@ -211,7 +211,7 @@ def configure_process_dpi() -> bool:
 
 
 def _on_widget_ui(widget: Any, action: Any) -> Any:
-    """All WinForms geometry and paint changes run on its owning UI thread."""
+    """所有 WinForms 几何与绘制改动必须在其所属 UI 线程上执行。"""
     native = getattr(widget, "native", None)
     if native is None:
         raise RuntimeError("Widget native window is not ready")
@@ -235,7 +235,7 @@ def _on_widget_ui(widget: Any, action: Any) -> Any:
 
 
 def _round_window_rgn(hwnd: int, width: int, height: int, scale: float) -> None:
-    """Apply the rounded clip from one shared geometry reading.
+    """基于同一份几何读数施加圆角裁剪。
 
     width/height 是同一次 UI action 里读回的客户区尺寸，scale 与该客户区
     取自同一次 GetDpiForWindow；客户区、WebView2 与裁剪因此共用同一份几何。
@@ -250,7 +250,7 @@ def _round_window_rgn(hwnd: int, width: int, height: int, scale: float) -> None:
     user.SetWindowRgn.restype = ctypes.c_int
     gdi.DeleteObject.argtypes = [wt.HGDIOBJ]
     gdi.DeleteObject.restype = wt.BOOL
-    # CreateRoundRectRgn takes ELLIPSE DIAMETER; CSS takes radius.
+    # CreateRoundRectRgn 收的是椭圆“直径”，CSS 圆角是“半径”，所以乘 2
     diameter = max(2, round(2 * WIDGET_RADIUS_CSS * scale))
     region = gdi.CreateRoundRectRgn(0, 0, width + 1, height + 1,
                                     diameter, diameter)
@@ -261,7 +261,7 @@ def _round_window_rgn(hwnd: int, width: int, height: int, scale: float) -> None:
 
 def _sync_widget_geometry(state: "_WindowState", widget: Any,
                           layout: Optional[str] = None) -> None:
-    """Size the CLIENT area, not the pre-frameless outer Size of BrowserForm."""
+    """设定的是客户区尺寸，不是无边框化之前 BrowserForm 的外框 Size。"""
     width, height = WIDGET_WINDOW_SIZES[layout or state.layout]
 
     def sync(native: Any) -> None:
@@ -272,8 +272,8 @@ def _sync_widget_geometry(state: "_WindowState", widget: Any,
         if not hwnd:
             return
         scale = max(1.0, ctypes.windll.user32.GetDpiForWindow(hwnd) / 96.0)
-        # The default Control background paints a grey rectangle below a
-        # transparent WebView shows the desktop through the window surface.
+        # WinForms 默认 Control 背景会在透明 WebView 底下画出灰色矩形，
+        # 改黑色让窗口表面直接透出桌面。
         native.BackColor = Color.Black
         target = Size(round(width * scale), round(height * scale))
         if native.ClientSize != target:
@@ -281,8 +281,8 @@ def _sync_widget_geometry(state: "_WindowState", widget: Any,
         view = native.webview
         view.DefaultBackgroundColor = Color.Transparent
         view.Dock = DockStyle.Fill
-        # Read the client rect back so the WebView bounds and the rounded
-        # clip share one geometry source even if WinForms adjusts the size.
+        # 回读实际客户区矩形：即使 WinForms 调整过尺寸，WebView 边界与圆角
+        # 裁剪也共用同一份几何来源。
         client = native.ClientRectangle
         view.Bounds = client
         native.PerformLayout()
@@ -293,7 +293,7 @@ def _sync_widget_geometry(state: "_WindowState", widget: Any,
 
 
 def _apply_rounded_region(widget: Any, state: "_WindowState") -> None:
-    """Clip the native surface to the same 28 CSS px radius as the page."""
+    """把原生表面裁剪成与页面一致的 28 CSS px 圆角。"""
     if widget is None:
         return
 
@@ -447,7 +447,7 @@ class WidgetApi:
 
 
     def toggle_layout(self) -> bool:
-        """Resize the existing WebView; keep its bridge, data and HWND alive."""
+        """只 resize 现有 WebView，桥、数据与 HWND 全部保留存活。"""
         state = self._state
         widget = state.widget
         if widget is None or not state._layout_lock.acquire(blocking=False):
@@ -575,7 +575,7 @@ _CHILD_PIPE_LOCK = threading.Lock()
 
 
 def _widget_moved_debounced(state: "_WindowState", x: int, y: int) -> None:
-    """Persist position once dragging settles; then resync for the new DPI."""
+    """拖动停稳（0.5s 去抖）后再持久化位置，并按新屏 DPI 重做几何同步。"""
     widget = state.widget
 
     def flush() -> None:
@@ -599,7 +599,7 @@ def _widget_moved_debounced(state: "_WindowState", x: int, y: int) -> None:
 
 
 def on_widget_loaded(state: "_WindowState", widget: Any = None) -> None:
-    """One initialization path for initial and reopened widgets."""
+    """首次创建与销毁后重建的贴纸走同一条初始化路径。"""
     widget = widget or state.widget
     if widget is None or widget is not state.widget or state.exiting:
         return
@@ -652,7 +652,7 @@ def on_widget_shown(state: "_WindowState", widget: Any = None) -> None:
 
 
 def on_widget_closed(state: "_WindowState", widget: Any = None) -> None:
-    """Ignore a stale window event; only the current window owns visibility."""
+    """忽略过期窗口事件：可见性只归当前贴纸窗口所有。"""
     widget = widget or state.widget
     if widget is not state.widget:
         return
@@ -694,7 +694,7 @@ def _ensure_widget_window(
     y: Optional[int] = None,
     size: Optional[tuple] = None,
 ) -> bool:
-    """Recreate only a genuinely closed window; layout changes never destroy it."""
+    """只在窗口真正关闭时才重建；布局切换从不销毁窗口。"""
     if state.widget is not None:
         return True
     width, height = size or WIDGET_WINDOW_SIZES[state.layout]
@@ -710,7 +710,7 @@ def _ensure_widget_window(
             return False
         state.widget = widget
         _bind_widget_events(state, widget)
-        # Runtime create_window can finish navigation before listeners attach.
+        # create_window 可能在监听器挂上前就完成导航；loaded 已置位时手动补跑初始化
         if widget.events.loaded.is_set():
             on_widget_loaded(state, widget)
         return True
@@ -776,7 +776,7 @@ def _window_cmd_loop(state: "_WindowState", pipe: Any) -> None:
                 if state.widget is not None:
                     state.widget.destroy()
             except Exception:
-                pass
+                _log.exception("[win] 销毁贴纸窗口失败")
             return
         elif cmd == "PLATFORM_STATE":
             if not isinstance(payload, dict):

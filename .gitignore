@@ -31,3 +31,4 @@ output/
 
 # Inno Setup 构建产物与构建日志（installer/GAUGE衡.iss 可重新生成）
 installer/out/
+.pytest_tmp/

@@ -22,9 +22,9 @@
 | `AI-Agent监控台.html` / `.data.json` | 生成的成品页与统计快照（网页/托盘/贴纸同源消费，可重新生成） |
 | `刷新数据.bat` | 手动重跑一次数据刷新 |
 | `desktop/` | 桌面版：`app.py` 入口、`monitor/` 支撑包、`tests/` 测试、`widget.html` 贴纸页、安装/启动/构建/快捷方式 bat |
-| `docs/` | 贴纸 v2 验收截图（常驻 / 展开 / 设置面板） |
+| `docs/` | 规划 / 阶段契约 / 进度台账 / 质检与审查报告 + 少量贴纸截图 |
 | `brand/` | GAUGE·衡 品牌资产（v2.0 设计语言与命名） |
-| `build/` `dist/` | EXE 构建产物（`desktop\构建EXE.bat` 重新生成；当前已清理） |
+| `build/` `dist/` | EXE 构建产物（`desktop\构建EXE.bat` 重新生成；当前已清空） |
 | `.mypy_cache/` `.pytest_cache/` `__pycache__/` | 工具缓存，运行时自动再生，可随时删 |
 
 ## EXE 形态（可选）

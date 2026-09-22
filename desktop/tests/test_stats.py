@@ -40,6 +40,31 @@ class TestCostOf:
         assert stats._cost_of("GLM-5.3", 0, 0, 0) == 0.0
 
 
+# ---------- 成本公式双链对拍（锁未来漂移；2026-09-22 质检 O2） ----------
+def test_cost_formula_matches_between_chains():
+    """refresh._row_cost 与 stats._cost_of 数值必须一致（固定输入逐组对拍）。
+
+    两链此前各自实现公式、无数值互证，一旦漂移会出现网页成本与托盘/贴纸
+    回退成本分叉且无报警。本测试锁现状而非修 bug：改任一侧公式必须双链
+    同步并保持本测试绿色。
+    """
+    from refresh import PRICING_CNY, _row_cost
+
+    prices = {r["model"]: {"input": r["input"], "cache_read": r["cache_read"],
+                           "output": r["output"]} for r in PRICING_CNY["rows"]}
+    # (model, 输入, 输出, 缓存读取)：覆盖两档系数表、钳制边界与零值
+    cases = [
+        ("GLM-5.3-Flash", 1_000_000, 100_000, 900_000),   # 常规：缓存读取 < 输入
+        ("GLM-5.3", 1_000_000, 100_000, 1_000_000),       # 边界：缓存读取 == 输入
+        ("GLM-5.3", 500_000, 50_000, 2_000_000),          # 钳制：缓存读取 > 输入按输入截断
+        ("GLM-5.3-Flash", 0, 0, 0),                       # 零值：全零 token
+        ("不存在模型", 1_000_000, 100_000, 900_000),       # 未配价模型按 0 计
+    ]
+    for model, it, ot, cr in cases:
+        assert _row_cost(model, it, ot, cr, prices) == pytest.approx(
+            stats._cost_of(model, it, ot, cr)), (model, it, ot, cr)
+
+
 # ---------- tooltip ----------
 class TestTooltip:
     def test_normal_and_truncation(self):
@@ -196,6 +221,10 @@ def test_credit_constants_match_between_chains():
     assert refresh_coeffs == stats.CREDIT_COEFFS
     assert refresh_quotas == stats.PLAN_QUOTAS
     assert refresh_divisor == stats.CREDIT_DIVISOR
+    # 默认档位此前在 refresh/stats/config 三处各自定义且无锁（2026-09-22 质检
+    # 发现），任一处单独改动都会造成贴纸档位回退口径分裂，一并锁住。
+    from refresh import DEFAULT_PLAN_TIER as refresh_default_tier
+    assert refresh_default_tier == stats.DEFAULT_PLAN_TIER == config.DEFAULT_PLAN_TIER
     # 档位命名漂移锁：config 的合法档位与 stats 的额度键集必须一致
     from monitor import config as widget_config
     assert set(widget_config.PLAN_TIERS) == set(stats.PLAN_QUOTAS)

@@ -700,6 +700,9 @@ def run():
     # 初始推送：数据 + 配置（子进程 loaded 事件后由命令循环注入渲染）
     # 初始贴纸数据同样优先 sidecar（启动兜底刷新刚跑完时已存在）
     def _initial_widget_push():
+        # 给 spawn 子进程留出引导时间（导入/建窗/页面加载）：PLATFORM_STATE 在
+        # 贴纸未就绪时会被子进程静默跳过，过早推送只会加重 loaded 重放兜底的
+        # 负担。子进程未向主进程回传就绪信号，此处为经验等待值，未量化校准。
         time.sleep(2)
         pushed = push_current_platform(force=True)
         if pushed is not None:
